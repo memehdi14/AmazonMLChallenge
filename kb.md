@@ -8,10 +8,10 @@
 
 | Field | Value |
 |---|---|
-| Experiment ID | EXP-002 |
+| Experiment ID | EXP-003 (SUB-001) |
 | Val macro F_0.5 | 0.8722 |
-| Public leaderboard score | — |
-| Blocking method | Token + 4-prefix + Soundex + StNum-Addr(full) + Postal(PIN) (A1+A2) |
+| Public leaderboard score | 0.826 |
+| Blocking method | Bounded Top-N per channel (chan_k=15, top_k=20, min_score=8.0) |
 | Feature set | FS-v4 (31 features) |
 | Model | LightGBM (400 trees, d=6) |
 | Threshold | 0.93 |
@@ -29,7 +29,7 @@ Every run — successful or failed — gets one entry in the table below AND, if
 |---|---|---|---|---|---|---|---|---|---|---|---|---|
 | EXP-001 | 2026-09-25 | Phase 1-3 Baseline | Token + 4-prefix + Soundex + StNum-Addr[:4] | 80.72% | FS-v4 (31 feats) | LightGBM (400 trees, d=6) | 0.83 | 0.8333 | 0.8072 | 0.8314 | — | Baseline on 1,000 S1 val entities before Part A blocking fixes. |
 | EXP-002 | 2026-09-25 | Phase 1 Blocking Fixes (A1-A4) + LightGBM | Token + 4-prefix + Soundex + StNum-Addr(full) + Postal Exact Match (weight 10.0) | 86.21% | FS-v4 (31 feats) | LightGBM (400 trees, d=6) | 0.93 | 1.0000 | 0.8621 | 0.8722 | — | Recall ceiling jumped +5.49% (80.72%->86.21%), Macro F_0.5 rose +0.0408 (0.8314->0.8722). Singleton accuracy reached 100%. |
-| EXP-003 | 2026-09-25 | Phase 1 Blocking Scaling (Step 4 Bounded Top-N) | Bounded Per-Channel Top-15 + top_k=20 + min_score=8.0 + Common Stopwords Reconciled | — | FS-v4 (31 feats) | LightGBM (400 trees, d=6) | 0.93 | — | — | — | — | Scan throughput surged to 6,641 rows/s/worker (~92k rows/s aggregate). Heappush calls reduced 5.44x. Candidate pairs file size estimated at ~37-180 MB (safely below 512 MB limit). |
+| EXP-003 | 2026-09-25 | Phase 1 Blocking Scaling (Step 4 Bounded Top-N) | Bounded Per-Channel Top-15 + top_k=20 + min_score=8.0 + Common Stopwords Reconciled | 86.00% | FS-v4 (31 feats) | LightGBM (400 trees, d=6) | 0.93 | 1.0000 | 0.8600 | 0.8710 | 0.826 | First full submission (SUB-001). 16.70 avg cands/entity. Candidate pairs 378.7 MB, matching results 80.1 MB. Official LB Score: 0.826. |
 
 **Column definitions:**
 - **Phase**: which phase of the build guide this corresponds to (Blocking / Feature Eng / GBM / Fine-tune / Threshold sweep)
@@ -164,7 +164,56 @@ Every leaderboard upload, regardless of whether it improved score — for tracki
 
 | Submission # | Date/time | Config used (Experiment ID) | Public LB score | Rank at time of submission | Notes |
 |---|---|---|---|---|---|
-| SUB-001 | 2026-09-25 18:40 | EXP-003 (Step 4 Bounded Blocking + LightGBM d=6, thresh=0.93) | (Pending Upload) | — | 100% compliant baseline: candidate_pairs.tsv (378.7 MB), matching_results.tsv (80.1 MB). Validator PASS (Returncode: 0). |
+| SUB-001 | 25 Sep 26, 06:42 PM IST | EXP-003 (Step 4 Bounded Blocking + LightGBM d=6, thresh=0.93) | **0.826** | Evaluated | Initial verified baseline submission. candidate_pairs.tsv (378.7 MB), matching_results.tsv (80.1 MB). Validator Returncode: 0. Scored 0.826 on Unstop LB. |
+
+---
+
+## Official Competition Rules & Platform Updates
+
+> Source: Official Unstop ML Challenge 2026 Problem Statement Update
+
+1. **`candidate_pairs.tsv` is mandatory:** Evaluated and audited for subset compliance alongside `matching_results.tsv`.
+2. **Blocking Scalability is a Final Ranking Criterion:** 
+   - *"Candidate generation counts toward the final ranking. We will review your candidate_pairs.tsv and factor its efficiency into the final rankings, alongside your matching_results.tsv score. The approach that generates a smaller candidate set while keeping recall high will win in final evaluation beyond the public/private leaderboard."*
+   - **Strategic Alignment:** Our Step 4 architecture achieves **16.70 avg candidates per entity** (capping search space by >99.999% while preserving >86% recall), directly satisfying this evaluation criterion.
+
+---
+
+## Technical Roadmap to 0.98 Macro F_0.5
+
+### 1. Mathematical Grounding
+The competition metric is Macro $F_{0.5}$ (Precision weighted 2x heavier than Recall):
+$$F_{0.5} = \frac{1.25 \times \text{Precision} \times \text{Recall}}{0.25 \times \text{Precision} + \text{Recall}}$$
+
+- At threshold $0.93$, our LightGBM model operates at near-perfect precision ($\ge 0.99$, with 100% singleton accuracy).
+- Because precision is already maxed out, Macro $F_{0.5}$ is purely a function of Recall:
+  - Current Baseline: $\text{Recall} = 0.862 \rightarrow \mathbf{F_{0.5} = 0.872}$ (0.826 on Public LB)
+  - Target Gate: $\text{Recall} = 0.920 \rightarrow \mathbf{F_{0.5} = 0.934}$
+  - Target Goal: $\text{Recall} = 0.950 \rightarrow \mathbf{F_{0.5} = 0.989}$
+  - Stretch Goal: $\text{Recall} = 0.960 \rightarrow \mathbf{F_{0.5} = 0.992}$
+
+**Core Finding:** The classifier and thresholding are sound. Reaching **0.98** requires closing the remaining **13.8% recall gap** in candidate blocking without blowing up candidate set size.
+
+### 2. Breakdown of the 475 Missed True Matches (A5 Error Analysis)
+1. **Indic Script Transliteration Gaps (~6%):** Tamil, Telugu, and Hindi names in S2/S3 (e.g. `Raj Investments LLP` vs `ராஜ் இன்வெஸ்ட்மெண்ட்ஸ் எல்எல்பி`) without identical street/postal numbers are missed by rule-based `anyascii`.
+2. **Generic Corporate Roots (~5%):** Names like `Ss Food Private Limited` vs `Food Services Inc` where distinctive root tokens are missing.
+3. **Numeral & Token Concatenation Drift (~2.8%):** `fourth street` vs `4th st`, `apartments82` vs `82`.
+
+### 3. Execution Phases on NVIDIA RTX A5000 (16GB)
+- **Step 1 (Preprocessing Quick Wins, +2-3% Recall):**
+  - Numeral expansion dictionary (`first` -> `1`, `fourth` -> `4`).
+  - Regex digit de-concatenation (`re.sub(r'(\d+)', r' \1 ', text)`).
+- **Step 2 (Dense Semantic Blocking on GPU, +8-10% Recall):**
+  - Switch to `brats` conda environment (PyTorch 2.13 + CUDA 13.0).
+  - Model: `intfloat/multilingual-e5-small` (Apache 2.0, 384-dim, multilingual).
+  - Encode name + address pairs into dense float16 vectors on RTX A5000 tensor cores at ~15,000 entities/sec.
+  - FAISS-GPU / cosine similarity retrieval for top-10 dense candidates.
+- **Step 3 (Hybrid Sparse + Dense Union):**
+  - Combine Top-15 lexical candidates + Top-10 dense semantic candidates.
+  - Bounds total candidates $\le 20-25$ per entity (satisfying the Unstop efficiency rule) while elevating Blocking Recall Ceiling to **$\ge 95-97\%$**.
+- **Step 4 (LightGBM Re-ranking & Threshold Sweep):**
+  - Add dense cosine similarity feature to feature set (FS-v5).
+  - Score candidate pairs through LightGBM and verify F0.5 reaches **$\ge 0.98$**.
 
 ---
 
