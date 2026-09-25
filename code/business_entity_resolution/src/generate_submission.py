@@ -26,6 +26,7 @@ from features import compute_pairwise_features
 from blocking import (
     format_candidate_pairs_file,
     _scan_chunk_worker,
+    _init_worker,
     _merge_heaps,
     COMMON_STOPWORDS,
     DEFAULT_MIN_SCORE
@@ -165,44 +166,53 @@ def run_test_submission(
     effective_workers = num_workers if num_workers is not None else max(1, min((os.cpu_count() or 4) - 2, 14))
     print(f"  Estimated index RAM across {effective_workers} workers: {total_mb * effective_workers:>8.2f} MB ({total_mb * effective_workers / 1024:.2f} GB)\n", flush=True)
 
-    # 3. Stream test_source2 and test_source3 to generate candidates
+    # 3. Stream test_source2 and test_source3 to generate candidates.
+    # Single persistent worker pool for BOTH files: indices are pickled to each
+    # worker exactly once (via initializer) instead of once per chunk per file,
+    # and workers aren't torn down and respawned between source2 and source3.
     candidates_heap = defaultdict(list)
+    indices = (
+        dict(token_index),
+        dict(compact_name_index),
+        dict(phonetic_index),
+        dict(prefix_index),
+        dict(st_num_addr_index),
+        dict(postal_index)
+    )
 
-    def scan_test_pool(filepath):
-        fname = os.path.basename(filepath)
-        t_start = time.time()
-        file_size = os.path.getsize(filepath)
+    import concurrent.futures
+    print(f"\nSpinning up {effective_workers} persistent workers for source2+source3 "
+          f"(indices broadcast once)...", flush=True)
 
-        if max_rows:
-            avg_line_bytes = 100
-            scan_bytes = min(file_size, int(max_rows * avg_line_bytes))
-            print(f"Truncated scan requested: max_rows={max_rows:,} (~{scan_bytes / (1024*1024):.1f} MB of {file_size / (1024*1024):.1f} MB)", flush=True)
-            chunk_size = scan_bytes // effective_workers
-            max_rows_per_worker = max_rows // effective_workers
-        else:
-            scan_bytes = file_size
-            chunk_size = file_size // effective_workers
-            max_rows_per_worker = None
+    with concurrent.futures.ProcessPoolExecutor(
+        max_workers=effective_workers,
+        initializer=_init_worker,
+        initargs=(indices, top_k, min_score)
+    ) as executor:
+        for filepath in [os.path.join(test_dir, "test_source2.tsv"), os.path.join(test_dir, "test_source3.tsv")]:
+            fname = os.path.basename(filepath)
+            t_start = time.time()
+            file_size = os.path.getsize(filepath)
 
-        print(f"\nScanning {fname} with {effective_workers} parallel CPU workers...", flush=True)
+            if max_rows:
+                avg_line_bytes = 100
+                scan_bytes = min(file_size, int(max_rows * avg_line_bytes))
+                print(f"Truncated scan requested: max_rows={max_rows:,} (~{scan_bytes / (1024*1024):.1f} MB of {file_size / (1024*1024):.1f} MB)", flush=True)
+                chunk_size = scan_bytes // effective_workers
+                max_rows_per_worker = max_rows // effective_workers
+            else:
+                scan_bytes = file_size
+                chunk_size = file_size // effective_workers
+                max_rows_per_worker = None
 
-        chunk_args = []
-        indices = (
-            dict(token_index),
-            dict(compact_name_index),
-            dict(phonetic_index),
-            dict(prefix_index),
-            dict(st_num_addr_index),
-            dict(postal_index)
-        )
-        for i in range(effective_workers):
-            start = i * chunk_size
-            end = scan_bytes if i == effective_workers - 1 else (i + 1) * chunk_size
-            chunk_args.append((filepath, start, end, indices, top_k, min_score, max_rows_per_worker))
+            print(f"\nScanning {fname} with {effective_workers} parallel CPU workers...", flush=True)
 
-        import concurrent.futures
-        with concurrent.futures.ProcessPoolExecutor(max_workers=effective_workers) as executor:
-            futures = [executor.submit(_scan_chunk_worker, *args) for args in chunk_args]
+            futures = []
+            for i in range(effective_workers):
+                start = i * chunk_size
+                end = scan_bytes if i == effective_workers - 1 else (i + 1) * chunk_size
+                futures.append(executor.submit(_scan_chunk_worker, filepath, start, end, max_rows_per_worker))
+
             completed = 0
             for fut in concurrent.futures.as_completed(futures):
                 completed += 1
@@ -210,10 +220,7 @@ def run_test_submission(
                 _merge_heaps(candidates_heap, worker_heap, top_k)
                 print(f"  [{fname}] Worker chunk {completed}/{effective_workers} merged ({completed/effective_workers*100:.0f}%)...", flush=True)
 
-        print(f"Finished {fname} in {time.time() - t_start:.1f}s.", flush=True)
-
-    scan_test_pool(os.path.join(test_dir, "test_source2.tsv"))
-    scan_test_pool(os.path.join(test_dir, "test_source3.tsv"))
+            print(f"Finished {fname} in {time.time() - t_start:.1f}s.", flush=True)
 
     # 4. Check candidate statistics and write candidate_pairs.tsv (Instructions 5 & 6)
     candidates = {s1_id: {cid for _, cid in heap} for s1_id, heap in candidates_heap.items()}

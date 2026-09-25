@@ -28,6 +28,26 @@ COMMON_STOPWORDS = {
 STOPWORDS = COMMON_STOPWORDS
 
 
+# --- Persistent worker state -------------------------------------------------
+# Populated once per worker process via the ProcessPoolExecutor `initializer`
+# instead of being re-pickled into every submitted task. Indices are read-only
+# for the lifetime of the pool, so this is safe.
+_WORKER_INDICES = None
+_WORKER_TOP_K = None
+_WORKER_MIN_SCORE = None
+
+
+def _init_worker(indices, top_k, min_score):
+    """Runs once when each worker process starts. This is what stops the large
+    index dicts from being pickled and shipped over IPC for every chunk / every
+    source file scanned — they're sent exactly once per worker for the life of
+    the pool instead."""
+    global _WORKER_INDICES, _WORKER_TOP_K, _WORKER_MIN_SCORE
+    _WORKER_INDICES = indices
+    _WORKER_TOP_K = top_k
+    _WORKER_MIN_SCORE = min_score
+
+
 class CandidateGenerator:
     """
     High-recall, low-overhead candidate generator.
@@ -117,25 +137,29 @@ class CandidateGenerator:
         print(f"  phonetic_index   : {orig_phon:,} -> {len(self.phonetic_index):,} keys")
         print(f"  postal_index     : {orig_post:,} -> {len(self.postal_index):,} keys", flush=True)
 
-    def scan_candidate_pool(
+    def scan_candidate_pools(
         self,
-        filepath: str,
+        filepaths: List[str],
         candidates_heap: Dict[str, List[Tuple[float, str]]],
         num_workers: Optional[int] = None,
         max_rows: Optional[int] = None
     ):
         """
-        Parallelized candidate pool scanner using ProcessPoolExecutor.
-        Slices file by byte offsets across available logical CPU cores.
+        Scans one or more candidate pool TSVs using a single, persistent
+        ProcessPoolExecutor. The index dicts are pickled to each worker exactly
+        ONCE, at pool startup (via `initializer`), instead of once per chunk per
+        file. This is the main fix for slow full-scale runs: with N workers and
+        M files, the old per-task approach re-pickled+re-shipped the full index
+        blob N*M times and spun up N fresh worker processes M times; this does
+        it N times total for the whole run.
         """
         import pickle
         import concurrent.futures
-        file_size = os.path.getsize(filepath)
         if num_workers is None:
             num_workers = max(1, min((os.cpu_count() or 4) - 2, 14))
 
-        # 3. Print the pickled size of each index dict before dispatching to workers
-        print("\n=== INDEX SERIALIZATION SIZES (PRE-DISPATCH) ===")
+        # Pickled size of each index dict, purely informational.
+        print("\n=== INDEX SERIALIZATION SIZES (PRE-DISPATCH, sent ONCE per worker) ===")
         total_mb = 0.0
         for name, idx in [
             ("token_index", self.token_index),
@@ -151,21 +175,6 @@ class CandidateGenerator:
         print(f"  {'TOTAL PER WORKER':20s}:          | {total_mb:>8.2f} MB")
         print(f"  Estimated index RAM across {num_workers} workers: {total_mb * num_workers:>8.2f} MB ({total_mb * num_workers / 1024:.2f} GB)\n", flush=True)
 
-        if max_rows:
-            # Estimate byte offset for max_rows to avoid scanning whole file
-            avg_line_bytes = 100
-            scan_bytes = min(file_size, int(max_rows * avg_line_bytes))
-            print(f"Truncated scan requested: max_rows={max_rows:,} (~{scan_bytes / (1024*1024):.1f} MB of {file_size / (1024*1024):.1f} MB)", flush=True)
-            chunk_size = scan_bytes // num_workers
-            max_rows_per_worker = max_rows // num_workers
-        else:
-            scan_bytes = file_size
-            chunk_size = file_size // num_workers
-            max_rows_per_worker = None
-
-        print(f"Scanning {os.path.basename(filepath)} with {num_workers} parallel CPU workers (min_score={self.min_score})...", flush=True)
-
-        chunk_args = []
         indices = (
             dict(self.token_index),
             dict(self.compact_name_index),
@@ -175,34 +184,72 @@ class CandidateGenerator:
             dict(self.postal_index)
         )
 
-        for i in range(num_workers):
-            start = i * chunk_size
-            end = scan_bytes if i == num_workers - 1 else (i + 1) * chunk_size
-            chunk_args.append((filepath, start, end, indices, self.top_k, self.min_score, max_rows_per_worker))
+        print(f"Spinning up {num_workers} persistent workers for {len(filepaths)} file(s) "
+              f"(min_score={self.min_score}); indices broadcast once...", flush=True)
 
-        with concurrent.futures.ProcessPoolExecutor(max_workers=num_workers) as executor:
-            futures = [executor.submit(_scan_chunk_worker, *args) for args in chunk_args]
-            completed = 0
-            for fut in concurrent.futures.as_completed(futures):
-                completed += 1
-                worker_heap = fut.result()
-                _merge_heaps(candidates_heap, worker_heap, self.top_k)
-                print(f"  Worker chunk {completed}/{num_workers} merged ({completed/num_workers*100:.0f}%)...", flush=True)
+        with concurrent.futures.ProcessPoolExecutor(
+            max_workers=num_workers,
+            initializer=_init_worker,
+            initargs=(indices, self.top_k, self.min_score)
+        ) as executor:
+            for filepath in filepaths:
+                file_size = os.path.getsize(filepath)
+
+                if max_rows:
+                    avg_line_bytes = 100
+                    scan_bytes = min(file_size, int(max_rows * avg_line_bytes))
+                    print(f"Truncated scan requested: max_rows={max_rows:,} "
+                          f"(~{scan_bytes / (1024*1024):.1f} MB of {file_size / (1024*1024):.1f} MB)", flush=True)
+                    chunk_size = scan_bytes // num_workers
+                    max_rows_per_worker = max_rows // num_workers
+                else:
+                    scan_bytes = file_size
+                    chunk_size = file_size // num_workers
+                    max_rows_per_worker = None
+
+                print(f"Scanning {os.path.basename(filepath)} with {num_workers} parallel CPU workers...", flush=True)
+
+                futures = []
+                for i in range(num_workers):
+                    start = i * chunk_size
+                    end = scan_bytes if i == num_workers - 1 else (i + 1) * chunk_size
+                    futures.append(executor.submit(_scan_chunk_worker, filepath, start, end, max_rows_per_worker))
+
+                completed = 0
+                for fut in concurrent.futures.as_completed(futures):
+                    completed += 1
+                    worker_heap = fut.result()
+                    _merge_heaps(candidates_heap, worker_heap, self.top_k)
+                    print(f"  [{os.path.basename(filepath)}] Worker chunk {completed}/{num_workers} merged "
+                          f"({completed/num_workers*100:.0f}%)...", flush=True)
+
+    def scan_candidate_pool(
+        self,
+        filepath: str,
+        candidates_heap: Dict[str, List[Tuple[float, str]]],
+        num_workers: Optional[int] = None,
+        max_rows: Optional[int] = None
+    ):
+        """Backward-compatible single-file wrapper. Prefer scan_candidate_pools()
+        when scanning multiple files so the worker pool and indices are reused."""
+        self.scan_candidate_pools([filepath], candidates_heap, num_workers=num_workers, max_rows=max_rows)
 
 
 def _scan_chunk_worker(
     filepath: str,
     start_offset: int,
     end_offset: int,
-    indices: Tuple,
-    top_k: int,
-    min_score: float,
     max_rows_per_worker: Optional[int] = None
 ) -> Dict[str, List[Tuple[float, str]]]:
     """
     Worker process that scans a specific byte slice of a candidate pool TSV.
+    Reads indices/top_k/min_score from process-global state set once by
+    `_init_worker` at pool startup, rather than receiving them as arguments
+    (which would re-pickle the whole index blob for every single chunk task).
     """
-    token_index, compact_name_index, phonetic_index, prefix_index, st_num_addr_index, postal_index = indices
+    token_index, compact_name_index, phonetic_index, prefix_index, st_num_addr_index, postal_index = _WORKER_INDICES
+    top_k = _WORKER_TOP_K
+    min_score = _WORKER_MIN_SCORE
     local_heap = defaultdict(list)
     row_count = 0
 

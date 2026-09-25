@@ -79,15 +79,11 @@ def generate_candidates(
     from collections import defaultdict
     candidates_heap = defaultdict(list)
 
-    print(f"Scanning {os.path.basename(s2_path)} for candidate generation...", flush=True)
+    print(f"Scanning {os.path.basename(s2_path)} + {os.path.basename(s3_path)} for candidate generation "
+          f"(single worker pool, indices sent once)...", flush=True)
     t0 = time.time()
-    generator.scan_candidate_pool(s2_path, candidates_heap)
-    print(f"Finished {os.path.basename(s2_path)} in {time.time() - t0:.1f}s.", flush=True)
-
-    print(f"Scanning {os.path.basename(s3_path)} for candidate generation...", flush=True)
-    t1 = time.time()
-    generator.scan_candidate_pool(s3_path, candidates_heap)
-    print(f"Finished {os.path.basename(s3_path)} in {time.time() - t1:.1f}s.", flush=True)
+    generator.scan_candidate_pools([s2_path, s3_path], candidates_heap)
+    print(f"Finished both source scans in {time.time() - t0:.1f}s.", flush=True)
 
     # Convert heaps to candidate sets
     candidates = {}
