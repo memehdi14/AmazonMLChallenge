@@ -115,6 +115,13 @@ def run_test_submission(
 
     print(f"Indexed {len(all_s1_ids):,} Test S1 entities in {time.time() - t0:.1f}s.", flush=True)
 
+    # Prune high-frequency tokens (appearing in > 150 entities) to prevent scanning bottlenecks
+    orig_tok = len(token_index)
+    token_index = {t: eids for t, eids in token_index.items() if len(eids) <= 150}
+    prefix_index = {p: eids for p, eids in prefix_index.items() if len(eids) <= 150}
+    st_num_addr_index = {k: eids for k, eids in st_num_addr_index.items() if len(eids) <= 100}
+    print(f"Pruned high-frequency tokens from {orig_tok:,} to {len(token_index):,} distinctive tokens.", flush=True)
+
     # 3. Stream test_source2 and test_source3 to generate candidates
     candidates_heap = defaultdict(list)
 
