@@ -13,11 +13,19 @@ from collections import defaultdict
 from typing import Dict, List, Set, Tuple, Optional
 from normalize import normalize_business_name, normalize_address, get_phonetic_keys
 
-STOPWORDS = {
+# Shared Canonical Configuration
+DEFAULT_MIN_SCORE = 3.0
+
+COMMON_STOPWORDS = {
+    # Functional / preposition words
     "the", "and", "of", "in", "at", "for", "on", "a", "an", "to", "by", "with", "from",
+    # Corporate / entity types
     "co", "inc", "llc", "ltd", "corp", "corporation", "pvt", "limited", "private", "services",
-    "enterprises", "company", "group", "sarl", "sas", "sa"
+    "enterprises", "company", "group", "sarl", "sas", "sa", "associates", "trading", "industries",
+    # Ultra-common generic business categories
+    "hotel", "restaurant", "store", "shop", "center", "centre", "solutions", "international"
 }
+STOPWORDS = COMMON_STOPWORDS
 
 
 class CandidateGenerator:
@@ -26,7 +34,7 @@ class CandidateGenerator:
     Indexes target reference entities and scans candidate source pools.
     """
 
-    def __init__(self, top_k: int = 50, min_score: float = 3.0):
+    def __init__(self, top_k: int = 50, min_score: float = DEFAULT_MIN_SCORE):
         self.top_k = top_k
         self.min_score = min_score
 
@@ -155,7 +163,7 @@ class CandidateGenerator:
             chunk_size = file_size // num_workers
             max_rows_per_worker = None
 
-        print(f"Scanning {os.path.basename(filepath)} with {num_workers} parallel CPU workers...", flush=True)
+        print(f"Scanning {os.path.basename(filepath)} with {num_workers} parallel CPU workers (min_score={self.min_score})...", flush=True)
 
         chunk_args = []
         indices = (
@@ -232,29 +240,29 @@ def _scan_chunk_worker(
 
             matched_scores = defaultdict(float)
 
-            # Channel A: Compact Name Exact Match
+            # Channel A: Compact Name Exact Match (exact match, max 15)
             if len(compact_cand) >= 4 and compact_cand in compact_name_index:
-                for ref_id in compact_name_index[compact_cand]:
+                for ref_id in compact_name_index[compact_cand][:15]:
                     matched_scores[ref_id] += 12.0
 
-            # Channel B: Distinctive name tokens
+            # Channel B: Distinctive name tokens (bounded to 15 per token)
             for t in cand_nt_set:
                 if t in token_index:
-                    for ref_id in token_index[t]:
+                    for ref_id in token_index[t][:15]:
                         matched_scores[ref_id] += 6.0
 
-            # Channel C: Stripped 4-prefix
+            # Channel C: Stripped 4-prefix (bounded to 10)
             if cand_prefix in prefix_index:
-                for ref_id in prefix_index[cand_prefix]:
+                for ref_id in prefix_index[cand_prefix][:10]:
                     matched_scores[ref_id] += 2.0
 
-            # Channel D: Phonetic similarity
+            # Channel D: Phonetic similarity (bounded to 10)
             for pk in cand_pks:
                 if pk in phonetic_index:
-                    for ref_id in phonetic_index[pk]:
+                    for ref_id in phonetic_index[pk][:10]:
                         matched_scores[ref_id] += 1.5
 
-            # Channel E: Compound Address Match
+            # Channel E: Compound Address Match (bounded to 15)
             cand_pc = {n for n in cand_num_set if len(n) in (5, 6)}
             cand_st_nums = cand_num_set - cand_pc
             if cand_st_nums:
@@ -262,13 +270,13 @@ def _scan_chunk_worker(
                     for at_val in addr_tokens:
                         key = (sn_val, at_val)
                         if key in st_num_addr_index:
-                            for ref_id in st_num_addr_index[key]:
+                            for ref_id in st_num_addr_index[key][:15]:
                                 matched_scores[ref_id] += 8.0
 
-            # Channel F: Postal Code Exact Match
+            # Channel F: Postal Code Exact Match (bounded to 10)
             for cand_pc_val in cand_pc:
                 if cand_pc_val in postal_index:
-                    for ref_id in postal_index[cand_pc_val]:
+                    for ref_id in postal_index[cand_pc_val][:10]:
                         matched_scores[ref_id] += 10.0
 
             # Push to local heaps

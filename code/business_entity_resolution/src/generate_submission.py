@@ -8,6 +8,8 @@ Generate Leaderboard Submission:
 
 import os
 import sys
+# Silence Loky core count detection warning on Windows
+os.environ.setdefault("LOKY_MAX_CPU_COUNT", str(min(os.cpu_count() or 14, 14)))
 import time
 import json
 import joblib
@@ -21,14 +23,13 @@ sys.stdout.reconfigure(encoding='utf-8')
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 from normalize import normalize_business_name, normalize_address, get_phonetic_keys
 from features import compute_pairwise_features
-from blocking import format_candidate_pairs_file, _scan_chunk_worker, _merge_heaps
-
-COMMON_TOKENS = {
-    "the", "and", "of", "in", "at", "for", "on", "a", "an", "to", "by", "with", "from",
-    "co", "inc", "llc", "ltd", "corp", "corporation", "pvt", "limited", "private", "services",
-    "enterprises", "company", "group", "sarl", "sas", "sa", "associates", "trading", "industries",
-    "hotel", "restaurant", "store", "shop", "center", "centre", "solutions", "international"
-}
+from blocking import (
+    format_candidate_pairs_file,
+    _scan_chunk_worker,
+    _merge_heaps,
+    COMMON_STOPWORDS,
+    DEFAULT_MIN_SCORE
+)
 
 
 def run_test_submission(
@@ -36,8 +37,8 @@ def run_test_submission(
     config_path: str,
     data_dir: str,
     output_dir: str,
-    top_k: int = 50,
-    min_score: float = 3.0,
+    top_k: int = 20,
+    min_score: float = 8.0,
     num_workers: Optional[int] = None,
     max_rows: Optional[int] = None
 ):
@@ -100,7 +101,7 @@ def run_test_submission(
 
             # Indices
             for t in set(nt):
-                if t not in COMMON_TOKENS and len(t) >= 3:
+                if t not in COMMON_STOPWORDS and len(t) >= 3:
                     token_index[t].append(eid)
 
             if len(compact) >= 4:
@@ -214,12 +215,40 @@ def run_test_submission(
     scan_test_pool(os.path.join(test_dir, "test_source2.tsv"))
     scan_test_pool(os.path.join(test_dir, "test_source3.tsv"))
 
-    # 4. Write candidate_pairs.tsv
-    print("\nWriting output/candidate_pairs.tsv...", flush=True)
+    # 4. Check candidate statistics and write candidate_pairs.tsv (Instructions 5 & 6)
     candidates = {s1_id: {cid for _, cid in heap} for s1_id, heap in candidates_heap.items()}
+    total_cand_entries = sum(len(c) for c in candidates.values())
+    touched_entities = len(candidates)
+    avg_cands = total_cand_entries / len(all_s1_ids) if all_s1_ids else 0.0
+
+    # Instruction 5: Estimate candidate_pairs.tsv file size before write
+    estimated_bytes = len(all_s1_ids) * avg_cands * 11
+    estimated_mb = estimated_bytes / (1024 * 1024)
+    print("\n" + "=" * 60)
+    print("=== INSTRUCTION 5: ESTIMATED candidate_pairs.tsv SIZE ===")
+    print(f"  Formula: {len(all_s1_ids):,} entities * {avg_cands:.2f} avg_cands * ~11 bytes")
+    print(f"  Estimated Size:          {estimated_mb:.1f} MB ({estimated_bytes:,.0f} bytes)")
+    print(f"  Hard Platform Limit:     512.0 MB")
+    print(f"  Safe Limit (-20% margin): 409.6 MB")
+    if estimated_mb >= 512.0 * 0.8:
+        print(f"  STATUS: [FAIL] Estimated size ({estimated_mb:.1f} MB) is within 20% of 512 MB ceiling! Stopping.")
+        return
+    else:
+        print(f"  STATUS: [PASS] Estimated size ({estimated_mb:.1f} MB) is safely below 512 MB.")
+    print("=" * 60, flush=True)
+
+    print("\nWriting output/candidate_pairs.tsv...", flush=True)
     cand_pairs_path = os.path.join(output_dir, "candidate_pairs.tsv")
     format_candidate_pairs_file(all_s1_ids, candidates, cand_pairs_path)
-    print(f"Saved {cand_pairs_path} successfully.", flush=True)
+
+    # Instruction 6: Verify real candidate_pairs.tsv file size
+    real_size = os.path.getsize(cand_pairs_path)
+    real_size_mb = real_size / (1024 * 1024)
+    print(f"Saved {cand_pairs_path} successfully ({real_size_mb:.2f} MB / {real_size:,} bytes).", flush=True)
+    if real_size_mb >= 512.0 * 0.8:
+        print(f"WARNING: candidate_pairs.tsv ({real_size_mb:.2f} MB) is within 20% of 512 MB limit!")
+    else:
+        print(f"Size verification: PASS ({real_size_mb:.2f} MB safely under 512 MB ceiling).\n")
 
     # 5. Extract candidate metadata for scoring
     needed_cand_ids = set()
@@ -336,7 +365,8 @@ if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="Generate submission for Amazon ML Challenge")
     parser.add_argument("--workers", type=int, default=14, help="Number of parallel workers (default 14)")
     parser.add_argument("--max-rows", type=int, default=None, help="Truncated sample size for testing (e.g. 500000)")
-    parser.add_argument("--min-score", type=float, default=3.0, help="Candidate min_score threshold (default 3.0)")
+    parser.add_argument("--top-k", type=int, default=20, help="Candidate pool size per entity (default 20)")
+    parser.add_argument("--min-score", type=float, default=8.0, help="Candidate min_score threshold (default 8.0)")
     args = parser.parse_args()
 
     repo_root = os.path.abspath(os.path.join(os.path.dirname(__file__), "..", "..", ".."))
@@ -353,6 +383,7 @@ if __name__ == "__main__":
             config_path=cfg_path,
             data_dir=data_directory,
             output_dir=output_directory,
+            top_k=args.top_k,
             min_score=args.min_score,
             num_workers=args.workers,
             max_rows=args.max_rows
