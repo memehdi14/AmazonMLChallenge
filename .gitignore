@@ -1,0 +1,30 @@
+# Git ignore for Amazon ML Challenge repository
+
+# Data files (GBs of raw TSVs)
+Dataset/
+dataset/
+*.tsv
+*.csv
+*.zip
+*.tar.gz
+*.pdf
+
+# Output directories
+output/
+*.log
+
+# Python cache
+__pycache__/
+*.py[cod]
+*$py.class
+.pytest_cache/
+
+# System and OS files
+.DS_Store
+__MACOSX/
+Thumbs.db
+
+# Virtual environments
+venv/
+env/
+.env
