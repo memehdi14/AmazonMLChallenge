@@ -15,6 +15,7 @@ import heapq
 import numpy as np
 import pandas as pd
 from collections import defaultdict
+from typing import Optional, Dict, List, Set, Tuple
 
 sys.stdout.reconfigure(encoding='utf-8')
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
@@ -36,7 +37,9 @@ def run_test_submission(
     data_dir: str,
     output_dir: str,
     top_k: int = 50,
-    min_score: float = 3.0
+    min_score: float = 3.0,
+    num_workers: Optional[int] = None,
+    max_rows: Optional[int] = None
 ):
     print("="*60)
     print("=== GENERATING LEADERBOARD SUBMISSION ===")
@@ -121,12 +124,45 @@ def run_test_submission(
 
     print(f"Indexed {len(all_s1_ids):,} Test S1 entities in {time.time() - t0:.1f}s.", flush=True)
 
-    # Prune ultra high-frequency tokens (appearing in > 300 entities) to prevent scanning bottlenecks
+    # 2b. Prune ultra high-frequency tokens / prefixes / address keys / phonetic / postal
     orig_tok = len(token_index)
+    orig_pfx = len(prefix_index)
+    orig_addr = len(st_num_addr_index)
+    orig_phon = len(phonetic_index)
+    orig_post = len(postal_index)
+
     token_index = {t: eids for t, eids in token_index.items() if len(eids) <= 300}
     prefix_index = {p: eids for p, eids in prefix_index.items() if len(eids) <= 300}
     st_num_addr_index = {k: eids for k, eids in st_num_addr_index.items() if len(eids) <= 200}
-    print(f"Pruned ultra high-frequency tokens from {orig_tok:,} to {len(token_index):,} distinctive tokens (thresholds: 300/300/200).", flush=True)
+    phonetic_index = {pk: eids for pk, eids in phonetic_index.items() if len(eids) <= 300}
+    postal_index = {pc: eids for pc, eids in postal_index.items() if len(eids) <= 100}
+
+    print(f"Index pruning applied (thresholds: tok<=300, pfx<=300, addr<=200, phon<=300, post<=100):")
+    print(f"  token_index      : {orig_tok:,} -> {len(token_index):,} keys")
+    print(f"  prefix_index     : {orig_pfx:,} -> {len(prefix_index):,} keys")
+    print(f"  st_num_addr_index: {orig_addr:,} -> {len(st_num_addr_index):,} keys")
+    print(f"  phonetic_index   : {orig_phon:,} -> {len(phonetic_index):,} keys")
+    print(f"  postal_index     : {orig_post:,} -> {len(postal_index):,} keys", flush=True)
+
+    # 2c. Print the pickled size of each index dict before dispatching to workers (Instruction 3)
+    import pickle
+    print("\n=== INDEX SERIALIZATION SIZES (PRE-DISPATCH) ===")
+    total_mb = 0.0
+    for name, idx in [
+        ("token_index", token_index),
+        ("compact_name_index", compact_name_index),
+        ("phonetic_index", phonetic_index),
+        ("prefix_index", prefix_index),
+        ("st_num_addr_index", st_num_addr_index),
+        ("postal_index", postal_index),
+    ]:
+        sz_mb = len(pickle.dumps(idx)) / (1024 * 1024)
+        total_mb += sz_mb
+        print(f"  {name:20s}: {len(idx):>8,} keys | {sz_mb:>8.2f} MB")
+    print(f"  {'TOTAL PER WORKER':20s}:          | {total_mb:>8.2f} MB")
+
+    effective_workers = num_workers if num_workers is not None else max(1, min((os.cpu_count() or 4) - 2, 14))
+    print(f"  Estimated index RAM across {effective_workers} workers: {total_mb * effective_workers:>8.2f} MB ({total_mb * effective_workers / 1024:.2f} GB)\n", flush=True)
 
     # 3. Stream test_source2 and test_source3 to generate candidates
     candidates_heap = defaultdict(list)
@@ -135,10 +171,20 @@ def run_test_submission(
         fname = os.path.basename(filepath)
         t_start = time.time()
         file_size = os.path.getsize(filepath)
-        num_workers = max(1, min((os.cpu_count() or 4) - 2, 14))
-        print(f"\nScanning {fname} with {num_workers} parallel CPU workers...", flush=True)
 
-        chunk_size = file_size // num_workers
+        if max_rows:
+            avg_line_bytes = 100
+            scan_bytes = min(file_size, int(max_rows * avg_line_bytes))
+            print(f"Truncated scan requested: max_rows={max_rows:,} (~{scan_bytes / (1024*1024):.1f} MB of {file_size / (1024*1024):.1f} MB)", flush=True)
+            chunk_size = scan_bytes // effective_workers
+            max_rows_per_worker = max_rows // effective_workers
+        else:
+            scan_bytes = file_size
+            chunk_size = file_size // effective_workers
+            max_rows_per_worker = None
+
+        print(f"\nScanning {fname} with {effective_workers} parallel CPU workers...", flush=True)
+
         chunk_args = []
         indices = (
             dict(token_index),
@@ -148,20 +194,20 @@ def run_test_submission(
             dict(st_num_addr_index),
             dict(postal_index)
         )
-        for i in range(num_workers):
+        for i in range(effective_workers):
             start = i * chunk_size
-            end = file_size if i == num_workers - 1 else (i + 1) * chunk_size
-            chunk_args.append((filepath, start, end, indices, top_k, min_score))
+            end = scan_bytes if i == effective_workers - 1 else (i + 1) * chunk_size
+            chunk_args.append((filepath, start, end, indices, top_k, min_score, max_rows_per_worker))
 
         import concurrent.futures
-        with concurrent.futures.ProcessPoolExecutor(max_workers=num_workers) as executor:
+        with concurrent.futures.ProcessPoolExecutor(max_workers=effective_workers) as executor:
             futures = [executor.submit(_scan_chunk_worker, *args) for args in chunk_args]
             completed = 0
             for fut in concurrent.futures.as_completed(futures):
                 completed += 1
                 worker_heap = fut.result()
                 _merge_heaps(candidates_heap, worker_heap, top_k)
-                print(f"  [{fname}] Worker chunk {completed}/{num_workers} merged ({completed/num_workers*100:.0f}%)...", flush=True)
+                print(f"  [{fname}] Worker chunk {completed}/{effective_workers} merged ({completed/effective_workers*100:.0f}%)...", flush=True)
 
         print(f"Finished {fname} in {time.time() - t_start:.1f}s.", flush=True)
 
@@ -286,6 +332,13 @@ def run_test_submission(
 
 
 if __name__ == "__main__":
+    import argparse
+    parser = argparse.ArgumentParser(description="Generate submission for Amazon ML Challenge")
+    parser.add_argument("--workers", type=int, default=14, help="Number of parallel workers (default 14)")
+    parser.add_argument("--max-rows", type=int, default=None, help="Truncated sample size for testing (e.g. 500000)")
+    parser.add_argument("--min-score", type=float, default=3.0, help="Candidate min_score threshold (default 3.0)")
+    args = parser.parse_args()
+
     repo_root = os.path.abspath(os.path.join(os.path.dirname(__file__), "..", "..", ".."))
     data_directory = os.path.join(repo_root, "dataset", "student_resource", "dataset")
     output_directory = os.path.join(repo_root, "output")
@@ -295,6 +348,14 @@ if __name__ == "__main__":
     cfg_path = os.path.join(artifacts_dir, "config.json")
     
     if os.path.exists(m_path) and os.path.exists(cfg_path):
-        run_test_submission(m_path, cfg_path, data_directory, output_directory)
+        run_test_submission(
+            model_path=m_path,
+            config_path=cfg_path,
+            data_dir=data_directory,
+            output_dir=output_directory,
+            min_score=args.min_score,
+            num_workers=args.workers,
+            max_rows=args.max_rows
+        )
     else:
         print(f"Model artifacts not found yet at {artifacts_dir}. Train the model first via pipeline.py!")

@@ -89,24 +89,74 @@ class CandidateGenerator:
                         if len(at_val) >= 3 and not at_val.isdigit():
                             self.st_num_addr_index[(sn_val, at_val)].append(eid)
 
+        # High-frequency pruning step (applied once before workers receive indices)
+        orig_tok = len(self.token_index)
+        orig_pfx = len(self.prefix_index)
+        orig_addr = len(self.st_num_addr_index)
+        orig_phon = len(self.phonetic_index)
+        orig_post = len(self.postal_index)
+
+        self.token_index = {t: eids for t, eids in self.token_index.items() if len(eids) <= 300}
+        self.prefix_index = {p: eids for p, eids in self.prefix_index.items() if len(eids) <= 300}
+        self.st_num_addr_index = {k: eids for k, eids in self.st_num_addr_index.items() if len(eids) <= 200}
+        self.phonetic_index = {pk: eids for pk, eids in self.phonetic_index.items() if len(eids) <= 300}
+        self.postal_index = {pc: eids for pc, eids in self.postal_index.items() if len(eids) <= 100}
+
+        print(f"Index pruning applied (thresholds: tok<=300, pfx<=300, addr<=200, phon<=300, post<=100):")
+        print(f"  token_index      : {orig_tok:,} -> {len(self.token_index):,} keys")
+        print(f"  prefix_index     : {orig_pfx:,} -> {len(self.prefix_index):,} keys")
+        print(f"  st_num_addr_index: {orig_addr:,} -> {len(self.st_num_addr_index):,} keys")
+        print(f"  phonetic_index   : {orig_phon:,} -> {len(self.phonetic_index):,} keys")
+        print(f"  postal_index     : {orig_post:,} -> {len(self.postal_index):,} keys", flush=True)
+
     def scan_candidate_pool(
         self,
         filepath: str,
         candidates_heap: Dict[str, List[Tuple[float, str]]],
-        num_workers: Optional[int] = None
+        num_workers: Optional[int] = None,
+        max_rows: Optional[int] = None
     ):
         """
         Parallelized candidate pool scanner using ProcessPoolExecutor.
         Slices file by byte offsets across available logical CPU cores.
         """
+        import pickle
         import concurrent.futures
         file_size = os.path.getsize(filepath)
         if num_workers is None:
             num_workers = max(1, min((os.cpu_count() or 4) - 2, 14))
 
+        # 3. Print the pickled size of each index dict before dispatching to workers
+        print("\n=== INDEX SERIALIZATION SIZES (PRE-DISPATCH) ===")
+        total_mb = 0.0
+        for name, idx in [
+            ("token_index", self.token_index),
+            ("compact_name_index", self.compact_name_index),
+            ("phonetic_index", self.phonetic_index),
+            ("prefix_index", self.prefix_index),
+            ("st_num_addr_index", self.st_num_addr_index),
+            ("postal_index", self.postal_index),
+        ]:
+            sz_mb = len(pickle.dumps(idx)) / (1024 * 1024)
+            total_mb += sz_mb
+            print(f"  {name:20s}: {len(idx):>8,} keys | {sz_mb:>8.2f} MB")
+        print(f"  {'TOTAL PER WORKER':20s}:          | {total_mb:>8.2f} MB")
+        print(f"  Estimated index RAM across {num_workers} workers: {total_mb * num_workers:>8.2f} MB ({total_mb * num_workers / 1024:.2f} GB)\n", flush=True)
+
+        if max_rows:
+            # Estimate byte offset for max_rows to avoid scanning whole file
+            avg_line_bytes = 100
+            scan_bytes = min(file_size, int(max_rows * avg_line_bytes))
+            print(f"Truncated scan requested: max_rows={max_rows:,} (~{scan_bytes / (1024*1024):.1f} MB of {file_size / (1024*1024):.1f} MB)", flush=True)
+            chunk_size = scan_bytes // num_workers
+            max_rows_per_worker = max_rows // num_workers
+        else:
+            scan_bytes = file_size
+            chunk_size = file_size // num_workers
+            max_rows_per_worker = None
+
         print(f"Scanning {os.path.basename(filepath)} with {num_workers} parallel CPU workers...", flush=True)
 
-        chunk_size = file_size // num_workers
         chunk_args = []
         indices = (
             dict(self.token_index),
@@ -119,8 +169,8 @@ class CandidateGenerator:
 
         for i in range(num_workers):
             start = i * chunk_size
-            end = file_size if i == num_workers - 1 else (i + 1) * chunk_size
-            chunk_args.append((filepath, start, end, indices, self.top_k, self.min_score))
+            end = scan_bytes if i == num_workers - 1 else (i + 1) * chunk_size
+            chunk_args.append((filepath, start, end, indices, self.top_k, self.min_score, max_rows_per_worker))
 
         with concurrent.futures.ProcessPoolExecutor(max_workers=num_workers) as executor:
             futures = [executor.submit(_scan_chunk_worker, *args) for args in chunk_args]
@@ -138,13 +188,15 @@ def _scan_chunk_worker(
     end_offset: int,
     indices: Tuple,
     top_k: int,
-    min_score: float
+    min_score: float,
+    max_rows_per_worker: Optional[int] = None
 ) -> Dict[str, List[Tuple[float, str]]]:
     """
     Worker process that scans a specific byte slice of a candidate pool TSV.
     """
     token_index, compact_name_index, phonetic_index, prefix_index, st_num_addr_index, postal_index = indices
     local_heap = defaultdict(list)
+    row_count = 0
 
     with open(filepath, "r", encoding="utf-8", errors="replace") as f:
         f.seek(start_offset)
@@ -154,11 +206,14 @@ def _scan_chunk_worker(
             f.readline()  # Skip TSV header line
 
         while True:
+            if max_rows_per_worker and row_count >= max_rows_per_worker:
+                break
             if end_offset > 0 and f.tell() >= end_offset:
                 break
             line = f.readline()
             if not line:
                 break
+            row_count += 1
 
             parts = line.strip().split("\t")
             cand_id = parts[0]
