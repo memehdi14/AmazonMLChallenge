@@ -67,8 +67,8 @@ def generate_candidates(
     s2_path: str,
     s3_path: str,
     top_k: int = 50,
-    min_score: float = 3.0
-) -> Dict[str, Set[str]]:
+    min_score: float = 2.0
+) -> Tuple[Dict[str, Set[str]], Dict[str, List[Tuple[float, str]]], CandidateGenerator]:
     """
     Runs multi-channel inverted-index blocking across Source 2 and Source 3.
     """
@@ -95,7 +95,7 @@ def generate_candidates(
         heap = candidates_heap.get(s1_id, [])
         candidates[s1_id] = {cid for _, cid in heap}
 
-    return candidates
+    return candidates, candidates_heap, generator
 
 
 def build_pairwise_features(
@@ -242,22 +242,51 @@ def run_validation_pipeline(data_dir: str, top_k: int = 50, num_s1: int = 2000):
 
     # Phase 1: Candidate Generation
     print("\n--- 2. Phase 1: Candidate Generation (Blocking) ---", flush=True)
-    candidates = generate_candidates(
+    candidates_all, candidates_heap, generator = generate_candidates(
         s1_records=s1_records,
         s2_path=os.path.join(train_dir, "train_source2.tsv"),
         s3_path=os.path.join(train_dir, "train_source3.tsv"),
         top_k=top_k,
-        min_score=3.0
+        min_score=2.0
     )
 
-    # Evaluate Blocking Recall
-    blocking_eval = evaluate_blocking_recall(gt_map, candidates)
-    print("\n=== BLOCKING RECALL CEILING ===")
+    # A4 Sweep: min_score in [3.0, 2.5, 2.0]
+    print("\n=== MIN_SCORE SWEEP [2.0, 2.5, 3.0] ON VAL SPLIT (A4) ===", flush=True)
+    sweep_evals = {}
+    for ms in [3.0, 2.5, 2.0]:
+        cands_at_ms = {
+            s1_id: {cid for sc, cid in candidates_heap.get(s1_id, []) if sc >= ms}
+            for s1_id in s1_records.keys()
+        }
+        b_eval = evaluate_blocking_recall(gt_map, cands_at_ms)
+        sweep_evals[ms] = (b_eval, cands_at_ms)
+        print(f"min_score={ms:.1f} -> Recall Ceiling: {b_eval['recall_ceiling']*100:.2f}%, "
+              f"Avg Candidates/Entity: {b_eval['avg_candidates_per_entity']:.2f}, "
+              f"Captured: {b_eval['captured_matches']:,}/{b_eval['total_true_matches']:,}", flush=True)
+
+    # Use canonical min_score = 3.0 for primary reporting and downstream training
+    blocking_eval, candidates = sweep_evals[3.0]
+    print("\n=== BLOCKING RECALL CEILING (canonical min_score=3.0) ===")
     for k, v in blocking_eval.items():
         if isinstance(v, float):
             print(f"  {k}: {v:.4f}")
         else:
             print(f"  {k}: {v:,}")
+
+    # A5: Missed match analysis
+    missed_pairs = []
+    for s1_id, true_matches in gt_map.items():
+        cands = candidates.get(s1_id, set())
+        missed = true_matches - cands
+        for m in missed:
+            missed_pairs.append((s1_id, m))
+
+    print(f"\n=== MISSED MATCH ANALYSIS (A5) === (Total missed at min_score=3.0: {len(missed_pairs):,})")
+    if missed_pairs:
+        print("Sample of 20 missed true match pairs for failure mode categorization:")
+        for idx, (s1_id, cand_id) in enumerate(missed_pairs[:20], 1):
+            s1_info = s1_records.get(s1_id, {})
+            print(f"  [{idx}] S1={s1_id} ('{s1_info.get('name', '')}', '{s1_info.get('clean_addr', '')}') vs Cand={cand_id}")
 
     # Phase 2: Feature Engineering
     print("\n--- 3. Phase 2: Pairwise Feature Construction ---", flush=True)
@@ -273,32 +302,10 @@ def run_validation_pipeline(data_dir: str, top_k: int = 50, num_s1: int = 2000):
     print("\n--- 4. Phase 3: LightGBM Training & Threshold Optimization ---", flush=True)
     from train_val_eval import evaluate_and_train_gbm
     
-    needed_cand_ids = set()
-    for cands in candidates.values():
-        needed_cand_ids.update(cands)
-        
-    cand_records = {}
-    for src in [os.path.join(train_dir, "train_source2.tsv"), os.path.join(train_dir, "train_source3.tsv")]:
-        with open(src, "r", encoding="utf-8") as f:
-            next(f)
-            for line in f:
-                p = line.strip().split("\t")
-                if p[0] in needed_cand_ids:
-                    cn, sn, nt = normalize_business_name(p[1] if len(p) > 1 else "")
-                    ca, lm, at, nums = normalize_address(p[2] if len(p) > 2 else "", p[3] if len(p) > 3 else "")
-                    cand_records[p[0]] = {
-                        "clean_name": cn, "stripped_name": sn, "name_tokens": nt,
-                        "clean_addr": ca, "landmark": lm, "has_landmark": 1 if lm else 0,
-                        "addr_tokens": at, "num_tokens": nums, "country": p[3] if len(p) > 3 else ""
-                    }
-                    if len(cand_records) >= len(needed_cand_ids):
-                        break
-
     model, best_thresh, best_f05, feature_cols = evaluate_and_train_gbm(
         val_candidates=candidates,
-        s1_records=s1_records,
-        target_records=cand_records,
-        ground_truth=gt_map
+        ground_truth=gt_map,
+        df_features=df_features
     )
 
     # Save artifacts
@@ -314,8 +321,11 @@ def run_validation_pipeline(data_dir: str, top_k: int = 50, num_s1: int = 2000):
 def main():
     parser = argparse.ArgumentParser(description="Business Entity Resolution End-to-End Pipeline")
     parser.add_argument("--mode", choices=["validate", "test"], default="validate", help="Pipeline execution mode")
-    parser.add_argument("--data-dir", default=r"c:\MMDPublic\Hackathons\Amazon ML challenge\Dataset\student_resource\dataset")
-    parser.add_argument("--output-dir", default=r"c:\MMDPublic\Hackathons\Amazon ML challenge\output")
+    repo_root = os.path.abspath(os.path.join(os.path.dirname(__file__), "..", "..", ".."))
+    default_data = os.path.join(repo_root, "dataset", "student_resource", "dataset")
+    default_out = os.path.join(repo_root, "output")
+    parser.add_argument("--data-dir", default=default_data)
+    parser.add_argument("--output-dir", default=default_out)
     parser.add_argument("--top-k", type=int, default=50, help="Candidate pool size per entity")
     parser.add_argument("--num-val-s1", type=int, default=2000, help="Number of S1 validation entities")
     args = parser.parse_args()

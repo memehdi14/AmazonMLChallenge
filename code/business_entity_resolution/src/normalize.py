@@ -116,7 +116,8 @@ def clean_base_text(text: str) -> str:
     if not text or not isinstance(text, str):
         return ""
     # Transliterate any non-Latin scripts to ASCII
-    text = anyascii.anyascii(text)
+    if not text.isascii():
+        text = anyascii.anyascii(text)
     # Strip accents
     text = strip_accents(text.lower())
     # Handle web domains: "maurewilliamscolombier.com" -> "maurewilliamscolombier"

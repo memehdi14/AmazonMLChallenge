@@ -17,10 +17,10 @@ import pandas as pd
 from collections import defaultdict
 
 sys.stdout.reconfigure(encoding='utf-8')
-sys.path.insert(0, r"c:\MMDPublic\Hackathons\Amazon ML challenge\code\business_entity_resolution\src")
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 from normalize import normalize_business_name, normalize_address, get_phonetic_keys
 from features import compute_pairwise_features
-from blocking import format_candidate_pairs_file
+from blocking import format_candidate_pairs_file, _scan_chunk_worker, _merge_heaps
 
 COMMON_TOKENS = {
     "the", "and", "of", "in", "at", "for", "on", "a", "an", "to", "by", "with", "from",
@@ -35,7 +35,8 @@ def run_test_submission(
     config_path: str,
     data_dir: str,
     output_dir: str,
-    top_k: int = 50
+    top_k: int = 50,
+    min_score: float = 3.0
 ):
     print("="*60)
     print("=== GENERATING LEADERBOARD SUBMISSION ===")
@@ -67,6 +68,7 @@ def run_test_submission(
     phonetic_index = defaultdict(list)
     prefix_index = defaultdict(list)
     st_num_addr_index = defaultdict(list)
+    postal_index = defaultdict(list)
 
     with open(s1_path, "r", encoding="utf-8") as f:
         next(f)
@@ -107,86 +109,61 @@ def run_test_submission(
             if p4 and len(p4) >= 3:
                 prefix_index[p4].append(eid)
 
+            # Postal code index
+            for pc_val in pc:
+                postal_index[pc_val].append(eid)
+
             if st_nums:
                 for sn_val in st_nums:
-                    for at_val in at[:3]:
+                    for at_val in at:
                         if len(at_val) >= 3 and not at_val.isdigit():
                             st_num_addr_index[(sn_val, at_val)].append(eid)
 
     print(f"Indexed {len(all_s1_ids):,} Test S1 entities in {time.time() - t0:.1f}s.", flush=True)
 
-    # Prune high-frequency tokens (appearing in > 150 entities) to prevent scanning bottlenecks
+    # Prune ultra high-frequency tokens (appearing in > 300 entities) to prevent scanning bottlenecks
     orig_tok = len(token_index)
-    token_index = {t: eids for t, eids in token_index.items() if len(eids) <= 150}
-    prefix_index = {p: eids for p, eids in prefix_index.items() if len(eids) <= 150}
-    st_num_addr_index = {k: eids for k, eids in st_num_addr_index.items() if len(eids) <= 100}
-    print(f"Pruned high-frequency tokens from {orig_tok:,} to {len(token_index):,} distinctive tokens.", flush=True)
+    token_index = {t: eids for t, eids in token_index.items() if len(eids) <= 300}
+    prefix_index = {p: eids for p, eids in prefix_index.items() if len(eids) <= 300}
+    st_num_addr_index = {k: eids for k, eids in st_num_addr_index.items() if len(eids) <= 200}
+    print(f"Pruned ultra high-frequency tokens from {orig_tok:,} to {len(token_index):,} distinctive tokens (thresholds: 300/300/200).", flush=True)
 
     # 3. Stream test_source2 and test_source3 to generate candidates
     candidates_heap = defaultdict(list)
 
     def scan_test_pool(filepath):
         fname = os.path.basename(filepath)
-        print(f"\nScanning {fname}...", flush=True)
         t_start = time.time()
-        count = 0
-        with open(filepath, "r", encoding="utf-8") as f:
-            next(f)
-            for line in f:
-                count += 1
-                p = line.strip().split("\t")
-                cid = p[0]
-                name = p[1] if len(p) > 1 else ""
-                addr = p[2] if len(p) > 2 else ""
-                country = p[3] if len(p) > 3 else ""
+        file_size = os.path.getsize(filepath)
+        num_workers = max(1, min((os.cpu_count() or 4) - 2, 14))
+        print(f"\nScanning {fname} with {num_workers} parallel CPU workers...", flush=True)
 
-                cn, sn, nt = normalize_business_name(name)
-                ca, lm, at, nums = normalize_address(addr, country)
-                compact_cand = "".join(nt)
-                p4 = sn[:4] if len(sn) >= 4 else sn
+        chunk_size = file_size // num_workers
+        chunk_args = []
+        indices = (
+            dict(token_index),
+            dict(compact_name_index),
+            dict(phonetic_index),
+            dict(prefix_index),
+            dict(st_num_addr_index),
+            dict(postal_index)
+        )
+        for i in range(num_workers):
+            start = i * chunk_size
+            end = file_size if i == num_workers - 1 else (i + 1) * chunk_size
+            chunk_args.append((filepath, start, end, indices, top_k, min_score))
 
-                scores = defaultdict(float)
+        import concurrent.futures
+        with concurrent.futures.ProcessPoolExecutor(max_workers=num_workers) as executor:
+            futures = [executor.submit(_scan_chunk_worker, *args) for args in chunk_args]
+            completed = 0
+            for fut in concurrent.futures.as_completed(futures):
+                completed += 1
+                worker_heap = fut.result()
+                _merge_heaps(candidates_heap, worker_heap, top_k)
+                print(f"  [{fname}] Worker chunk {completed}/{num_workers} merged ({completed/num_workers*100:.0f}%)...", flush=True)
 
-                if len(compact_cand) >= 4 and compact_cand in compact_name_index:
-                    for s1_id in compact_name_index[compact_cand]:
-                        scores[s1_id] += 12.0
-
-                for t in nt:
-                    if t in token_index:
-                        for s1_id in token_index[t]:
-                            scores[s1_id] += 6.0
-
-                if p4 in prefix_index:
-                    for s1_id in prefix_index[p4]:
-                        scores[s1_id] += 2.0
-
-                if nt:
-                    for pk in get_phonetic_keys(nt[:1]):
-                        if pk in phonetic_index:
-                            for s1_id in phonetic_index[pk]:
-                                scores[s1_id] += 1.5
-
-                cand_pc = {n for n in nums if len(n) in (5, 6)}
-                cand_st_nums = nums - cand_pc
-                if cand_st_nums:
-                    for sn_val in cand_st_nums:
-                        for at_val in at[:4]:
-                            key = (sn_val, at_val)
-                            if key in st_num_addr_index:
-                                for s1_id in st_num_addr_index[key]:
-                                    scores[s1_id] += 8.0
-
-                for s1_id, sc in scores.items():
-                    if sc >= 5.0:
-                        h = candidates_heap[s1_id]
-                        if len(h) < top_k:
-                            heapq.heappush(h, (sc, cid))
-                        elif sc > h[0][0]:
-                            heapq.heapreplace(h, (sc, cid))
-
-                if count % 1000000 == 0:
-                    el = time.time() - t_start
-                    print(f"  [{fname}] {count:,} rows in {el:.1f}s ({count/el:,.0f} rows/s)...", flush=True)
+        print(f"Finished {fname} in {time.time() - t_start:.1f}s.", flush=True)
 
     scan_test_pool(os.path.join(test_dir, "test_source2.tsv"))
     scan_test_pool(os.path.join(test_dir, "test_source3.tsv"))
@@ -309,9 +286,10 @@ def run_test_submission(
 
 
 if __name__ == "__main__":
-    data_directory = r"c:\MMDPublic\Hackathons\Amazon ML challenge\Dataset\student_resource\dataset"
-    output_directory = r"c:\MMDPublic\Hackathons\Amazon ML challenge\output"
-    artifacts_dir = r"c:\MMDPublic\Hackathons\Amazon ML challenge\code\business_entity_resolution\artifacts"
+    repo_root = os.path.abspath(os.path.join(os.path.dirname(__file__), "..", "..", ".."))
+    data_directory = os.path.join(repo_root, "dataset", "student_resource", "dataset")
+    output_directory = os.path.join(repo_root, "output")
+    artifacts_dir = os.path.join(repo_root, "code", "business_entity_resolution", "artifacts")
     
     m_path = os.path.join(artifacts_dir, "lgbm_model.pkl")
     cfg_path = os.path.join(artifacts_dir, "config.json")

@@ -9,9 +9,9 @@ import pickle
 import numpy as np
 import pandas as pd
 import lightgbm as lgb
-from typing import Dict, List, Set, Tuple
+from typing import Dict, List, Set, Tuple, Optional
 
-sys.path.insert(0, r"c:\MMDPublic\Hackathons\Amazon ML challenge\code\business_entity_resolution\src")
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 from metrics import evaluate_macro_f05, compute_entity_f05
 from features import compute_pairwise_features
 from train_gbm import train_matching_gbm, sweep_macro_f05_threshold
@@ -19,57 +19,62 @@ from train_gbm import train_matching_gbm, sweep_macro_f05_threshold
 
 def evaluate_and_train_gbm(
     val_candidates: Dict[str, Set[str]],
-    s1_records: Dict[str, Dict],
-    target_records: Dict[str, Dict],
-    ground_truth: Dict[str, Set[str]],
-    test_ratio: float = 0.3
+    s1_records: Dict[str, Dict] = None,
+    target_records: Dict[str, Dict] = None,
+    ground_truth: Dict[str, Set[str]] = None,
+    test_ratio: float = 0.3,
+    df_features: Optional[pd.DataFrame] = None
 ):
     """
     Builds pairwise features on candidate pairs, splits into train/val folds,
     trains LightGBM, and performs threshold optimization for macro F_0.5.
     """
-    print("\n" + "="*50)
-    print("=== PHASE 2: BUILDING PAIRWISE FEATURES ===")
-    print("="*50)
-    
-    rows = []
-    t0 = time.time()
-    
-    for s1_id, cands in val_candidates.items():
-        s1 = s1_records[s1_id]
-        true_set = ground_truth.get(s1_id, set())
+    if df_features is not None:
+        df = df_features
+        print(f"Using precomputed feature dataframe with {len(df):,} pairs.")
+    else:
+        print("\n" + "="*50)
+        print("=== PHASE 2: BUILDING PAIRWISE FEATURES ===")
+        print("="*50)
         
-        for cid in cands:
-            if cid not in target_records:
-                continue
-            cand = target_records[cid]
+        rows = []
+        t0 = time.time()
+        
+        for s1_id, cands in val_candidates.items():
+            s1 = s1_records[s1_id]
+            true_set = ground_truth.get(s1_id, set()) if ground_truth else set()
             
-            feats = compute_pairwise_features(
-                s1_name_clean=s1["clean_name"],
-                s1_name_stripped=s1["stripped_name"],
-                s1_name_tokens=s1["name_tokens"],
-                s1_addr_clean=s1["clean_addr"],
-                s1_addr_tokens=s1["addr_tokens"],
-                s1_num_tokens=s1["num_tokens"],
-                s1_country=s1["country"],
-                s1_has_landmark=s1.get("has_landmark", 0),
-                cand_id=cid,
-                cand_name_clean=cand["clean_name"],
-                cand_name_stripped=cand["stripped_name"],
-                cand_name_tokens=cand["name_tokens"],
-                cand_addr_clean=cand["clean_addr"],
-                cand_addr_tokens=cand["addr_tokens"],
-                cand_num_tokens=cand["num_tokens"],
-                cand_country=cand["country"],
-                cand_has_landmark=cand.get("has_landmark", 0)
-            )
-            feats["source1_entity_id"] = s1_id
-            feats["candidate_id"] = cid
-            feats["label"] = 1 if cid in true_set else 0
-            rows.append(feats)
+            for cid in cands:
+                if cid not in target_records:
+                    continue
+                cand = target_records[cid]
+                
+                feats = compute_pairwise_features(
+                    s1_name_clean=s1["clean_name"],
+                    s1_name_stripped=s1["stripped_name"],
+                    s1_name_tokens=s1["name_tokens"],
+                    s1_addr_clean=s1["clean_addr"],
+                    s1_addr_tokens=s1["addr_tokens"],
+                    s1_num_tokens=s1["num_tokens"],
+                    s1_country=s1["country"],
+                    s1_has_landmark=s1.get("has_landmark", 0),
+                    cand_id=cid,
+                    cand_name_clean=cand["clean_name"],
+                    cand_name_stripped=cand["stripped_name"],
+                    cand_name_tokens=cand["name_tokens"],
+                    cand_addr_clean=cand["clean_addr"],
+                    cand_addr_tokens=cand["addr_tokens"],
+                    cand_num_tokens=cand["num_tokens"],
+                    cand_country=cand["country"],
+                    cand_has_landmark=cand.get("has_landmark", 0)
+                )
+                feats["source1_entity_id"] = s1_id
+                feats["candidate_id"] = cid
+                feats["label"] = 1 if cid in true_set else 0
+                rows.append(feats)
 
-    df = pd.DataFrame(rows)
-    print(f"Constructed {len(df):,} candidate pairs in {time.time() - t0:.2f}s.")
+        df = pd.DataFrame(rows)
+        print(f"Constructed {len(df):,} candidate pairs in {time.time() - t0:.2f}s.")
     pos_count = (df["label"] == 1).sum()
     neg_count = (df["label"] == 0).sum()
     print(f"Class Balance: {pos_count:,} positives (true matches) vs {neg_count:,} negatives ({pos_count/len(df)*100:.2f}% positive).")

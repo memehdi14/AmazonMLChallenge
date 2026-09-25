@@ -36,6 +36,7 @@ class CandidateGenerator:
         self.phonetic_index = defaultdict(list)
         self.prefix_index = defaultdict(list)
         self.st_num_addr_index = defaultdict(list)
+        self.postal_index = defaultdict(list)
 
         # Entity metadata cache
         self.entity_meta = {}
@@ -76,12 +77,15 @@ class CandidateGenerator:
             if prefix4 and len(prefix4) >= 3:
                 self.prefix_index[prefix4].append(eid)
 
-            # 5. Compound Address: (st_num, first distinctive addr token)
+            # 5. Compound Address & Postal Code Matching
             pc = {n for n in nums if len(n) in (5, 6)}
+            for pc_val in pc:
+                self.postal_index[pc_val].append(eid)
+
             st_nums = nums - pc
             if st_nums:
                 for sn_val in st_nums:
-                    for at_val in list(at)[:3]:
+                    for at_val in at:
                         if len(at_val) >= 3 and not at_val.isdigit():
                             self.st_num_addr_index[(sn_val, at_val)].append(eid)
 
@@ -89,83 +93,154 @@ class CandidateGenerator:
         self,
         filepath: str,
         candidates_heap: Dict[str, List[Tuple[float, str]]],
-        max_rows: Optional[int] = None,
-        callback_interval: int = 1000000
+        num_workers: Optional[int] = None
     ):
         """
-        Streams through a candidate pool TSV (Source 2 or Source 3)
-        and scores plausible matches against indexed reference entities.
+        Parallelized candidate pool scanner using ProcessPoolExecutor.
+        Slices file by byte offsets across available logical CPU cores.
         """
-        with open(filepath, "r", encoding="utf-8") as f:
-            next(f) # header
-            count = 0
-            for line in f:
-                count += 1
-                parts = line.strip().split("\t")
-                cand_id = parts[0]
-                name = parts[1] if len(parts) > 1 else ""
-                addr = parts[2] if len(parts) > 2 else ""
-                country = parts[3] if len(parts) > 3 else ""
+        import concurrent.futures
+        file_size = os.path.getsize(filepath)
+        if num_workers is None:
+            num_workers = max(1, min((os.cpu_count() or 4) - 2, 14))
 
-                clean_name, stripped_name, name_tokens = normalize_business_name(name)
-                clean_addr, landmark, addr_tokens, num_tokens = normalize_address(addr, country)
+        print(f"Scanning {os.path.basename(filepath)} with {num_workers} parallel CPU workers...", flush=True)
 
-                cand_nt_set = set(name_tokens)
-                cand_at_set = set(addr_tokens)
-                cand_num_set = set(num_tokens)
-                cand_pks = get_phonetic_keys(name_tokens[:1])
-                cand_prefix = stripped_name[:4] if len(stripped_name) >= 4 else stripped_name
-                compact_cand = "".join(name_tokens)
+        chunk_size = file_size // num_workers
+        chunk_args = []
+        indices = (
+            dict(self.token_index),
+            dict(self.compact_name_index),
+            dict(self.phonetic_index),
+            dict(self.prefix_index),
+            dict(self.st_num_addr_index),
+            dict(self.postal_index)
+        )
 
-                # Score potential references
-                matched_scores = defaultdict(float)
+        for i in range(num_workers):
+            start = i * chunk_size
+            end = file_size if i == num_workers - 1 else (i + 1) * chunk_size
+            chunk_args.append((filepath, start, end, indices, self.top_k, self.min_score))
 
-                # Channel A: Compact Name Exact Match (Domain name / merged token)
-                if len(compact_cand) >= 4 and compact_cand in self.compact_name_index:
-                    for ref_id in self.compact_name_index[compact_cand]:
-                        matched_scores[ref_id] += 12.0
+        with concurrent.futures.ProcessPoolExecutor(max_workers=num_workers) as executor:
+            futures = [executor.submit(_scan_chunk_worker, *args) for args in chunk_args]
+            completed = 0
+            for fut in concurrent.futures.as_completed(futures):
+                completed += 1
+                worker_heap = fut.result()
+                _merge_heaps(candidates_heap, worker_heap, self.top_k)
+                print(f"  Worker chunk {completed}/{num_workers} merged ({completed/num_workers*100:.0f}%)...", flush=True)
 
-                # Channel B: Distinctive name tokens
-                for t in cand_nt_set:
-                    if t in self.token_index:
-                        for ref_id in self.token_index[t]:
-                            matched_scores[ref_id] += 6.0
 
-                # Channel C: Stripped 4-prefix
-                if cand_prefix in self.prefix_index:
-                    for ref_id in self.prefix_index[cand_prefix]:
-                        matched_scores[ref_id] += 2.0
+def _scan_chunk_worker(
+    filepath: str,
+    start_offset: int,
+    end_offset: int,
+    indices: Tuple,
+    top_k: int,
+    min_score: float
+) -> Dict[str, List[Tuple[float, str]]]:
+    """
+    Worker process that scans a specific byte slice of a candidate pool TSV.
+    """
+    token_index, compact_name_index, phonetic_index, prefix_index, st_num_addr_index, postal_index = indices
+    local_heap = defaultdict(list)
 
-                # Channel D: Phonetic similarity
-                for pk in cand_pks:
-                    if pk in self.phonetic_index:
-                        for ref_id in self.phonetic_index[pk]:
-                            matched_scores[ref_id] += 1.5
+    with open(filepath, "r", encoding="utf-8", errors="replace") as f:
+        f.seek(start_offset)
+        if start_offset != 0:
+            f.readline()  # Skip incomplete partial line
+        else:
+            f.readline()  # Skip TSV header line
 
-                # Channel E: Compound Address Match: (street_number, addr_token)
-                cand_pc = {n for n in cand_num_set if len(n) in (5, 6)}
-                cand_st_nums = cand_num_set - cand_pc
-                if cand_st_nums:
-                    for sn_val in cand_st_nums:
-                        for at_val in addr_tokens[:4]:
-                            key = (sn_val, at_val)
-                            if key in self.st_num_addr_index:
-                                for ref_id in self.st_num_addr_index[key]:
-                                    matched_scores[ref_id] += 8.0
+        while True:
+            if end_offset > 0 and f.tell() >= end_offset:
+                break
+            line = f.readline()
+            if not line:
+                break
 
-                # Push to heaps
-                for ref_id, score in matched_scores.items():
-                    if score >= self.min_score:
-                        heap = candidates_heap[ref_id]
-                        if len(heap) < self.top_k:
-                            heapq.heappush(heap, (score, cand_id))
-                        elif score > heap[0][0]:
-                            heapq.heapreplace(heap, (score, cand_id))
-                        elif score > heap[0][0]:
-                            heapq.heapreplace(heap, (score, cand_id))
+            parts = line.strip().split("\t")
+            cand_id = parts[0]
+            name = parts[1] if len(parts) > 1 else ""
+            addr = parts[2] if len(parts) > 2 else ""
+            country = parts[3] if len(parts) > 3 else ""
 
-                if max_rows and count >= max_rows:
-                    break
+            clean_name, stripped_name, name_tokens = normalize_business_name(name)
+            clean_addr, landmark, addr_tokens, num_tokens = normalize_address(addr, country)
+
+            cand_nt_set = set(name_tokens)
+            cand_num_set = set(num_tokens)
+            cand_pks = get_phonetic_keys(name_tokens[:1])
+            cand_prefix = stripped_name[:4] if len(stripped_name) >= 4 else stripped_name
+            compact_cand = "".join(name_tokens)
+
+            matched_scores = defaultdict(float)
+
+            # Channel A: Compact Name Exact Match
+            if len(compact_cand) >= 4 and compact_cand in compact_name_index:
+                for ref_id in compact_name_index[compact_cand]:
+                    matched_scores[ref_id] += 12.0
+
+            # Channel B: Distinctive name tokens
+            for t in cand_nt_set:
+                if t in token_index:
+                    for ref_id in token_index[t]:
+                        matched_scores[ref_id] += 6.0
+
+            # Channel C: Stripped 4-prefix
+            if cand_prefix in prefix_index:
+                for ref_id in prefix_index[cand_prefix]:
+                    matched_scores[ref_id] += 2.0
+
+            # Channel D: Phonetic similarity
+            for pk in cand_pks:
+                if pk in phonetic_index:
+                    for ref_id in phonetic_index[pk]:
+                        matched_scores[ref_id] += 1.5
+
+            # Channel E: Compound Address Match
+            cand_pc = {n for n in cand_num_set if len(n) in (5, 6)}
+            cand_st_nums = cand_num_set - cand_pc
+            if cand_st_nums:
+                for sn_val in cand_st_nums:
+                    for at_val in addr_tokens:
+                        key = (sn_val, at_val)
+                        if key in st_num_addr_index:
+                            for ref_id in st_num_addr_index[key]:
+                                matched_scores[ref_id] += 8.0
+
+            # Channel F: Postal Code Exact Match
+            for cand_pc_val in cand_pc:
+                if cand_pc_val in postal_index:
+                    for ref_id in postal_index[cand_pc_val]:
+                        matched_scores[ref_id] += 10.0
+
+            # Push to local heaps
+            for ref_id, score in matched_scores.items():
+                if score >= min_score:
+                    h = local_heap[ref_id]
+                    if len(h) < top_k:
+                        heapq.heappush(h, (score, cand_id))
+                    elif score > h[0][0]:
+                        heapq.heapreplace(h, (score, cand_id))
+
+    return dict(local_heap)
+
+
+def _merge_heaps(
+    target_heap: Dict[str, List[Tuple[float, str]]],
+    source_heap: Dict[str, List[Tuple[float, str]]],
+    top_k: int
+):
+    """Merges a worker heap into the master candidates heap."""
+    for ref_id, items in source_heap.items():
+        h = target_heap[ref_id]
+        for sc, cid in items:
+            if len(h) < top_k:
+                heapq.heappush(h, (sc, cid))
+            elif sc > h[0][0]:
+                heapq.heapreplace(h, (sc, cid))
 
 
 def format_candidate_pairs_file(
