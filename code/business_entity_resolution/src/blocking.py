@@ -32,9 +32,10 @@ class CandidateGenerator:
 
         # Indices
         self.token_index = defaultdict(list)
+        self.compact_name_index = defaultdict(list)
         self.phonetic_index = defaultdict(list)
         self.prefix_index = defaultdict(list)
-        self.addr_num_index = defaultdict(list)
+        self.st_num_addr_index = defaultdict(list)
 
         # Entity metadata cache
         self.entity_meta = {}
@@ -42,15 +43,6 @@ class CandidateGenerator:
     def index_reference_entities(self, records: Dict[str, Dict]):
         """
         Builds inverted indices for reference entities (e.g. Source 1 entities).
-        records mapping: entity_id -> {
-            'clean_name': str,
-            'stripped_name': str,
-            'name_tokens': List[str],
-            'clean_addr': str,
-            'addr_tokens': List[str],
-            'num_tokens': Set[str],
-            'country': str
-        }
         """
         for eid, r in records.items():
             self.entity_meta[eid] = {
@@ -59,25 +51,39 @@ class CandidateGenerator:
                 "country": r.get("country", "")
             }
 
+            nt = r["name_tokens"]
+            sn = r["stripped_name"]
+            nums = r["num_tokens"]
+            at = r["addr_tokens"]
+
             # 1. Distinctive name tokens
-            for t in set(r["name_tokens"]):
+            for t in set(nt):
                 if t not in STOPWORDS and len(t) >= 3:
                     self.token_index[t].append(eid)
 
-            # 2. Phonetic keys
-            pks = get_phonetic_keys(r["name_tokens"][:2])
+            # 2. Compact name (handles domain names like devotiondealmark.com)
+            compact = "".join(nt)
+            if len(compact) >= 4:
+                self.compact_name_index[compact].append(eid)
+
+            # 3. Phonetic keys
+            pks = get_phonetic_keys(nt[:1])
             for pk in pks:
                 self.phonetic_index[pk].append(eid)
 
-            # 3. Stripped name prefix (length 4)
-            prefix4 = r["stripped_name"][:4] if len(r["stripped_name"]) >= 4 else r["stripped_name"]
+            # 4. Stripped name prefix (length 4)
+            prefix4 = sn[:4] if len(sn) >= 4 else sn
             if prefix4 and len(prefix4) >= 3:
                 self.prefix_index[prefix4].append(eid)
 
-            # 4. Numeric address tokens
-            for nt in r["num_tokens"]:
-                if len(nt) >= 2:
-                    self.addr_num_index[nt].append(eid)
+            # 5. Compound Address: (st_num, first distinctive addr token)
+            pc = {n for n in nums if len(n) in (5, 6)}
+            st_nums = nums - pc
+            if st_nums:
+                for sn_val in st_nums:
+                    for at_val in list(at)[:3]:
+                        if len(at_val) >= 3 and not at_val.isdigit():
+                            self.st_num_addr_index[(sn_val, at_val)].append(eid)
 
     def scan_candidate_pool(
         self,
@@ -107,35 +113,45 @@ class CandidateGenerator:
                 cand_nt_set = set(name_tokens)
                 cand_at_set = set(addr_tokens)
                 cand_num_set = set(num_tokens)
-                cand_pks = get_phonetic_keys(name_tokens[:2])
+                cand_pks = get_phonetic_keys(name_tokens[:1])
                 cand_prefix = stripped_name[:4] if len(stripped_name) >= 4 else stripped_name
+                compact_cand = "".join(name_tokens)
 
                 # Score potential references
                 matched_scores = defaultdict(float)
 
-                # Channel A: Distinctive name tokens
+                # Channel A: Compact Name Exact Match (Domain name / merged token)
+                if len(compact_cand) >= 4 and compact_cand in self.compact_name_index:
+                    for ref_id in self.compact_name_index[compact_cand]:
+                        matched_scores[ref_id] += 12.0
+
+                # Channel B: Distinctive name tokens
                 for t in cand_nt_set:
                     if t in self.token_index:
                         for ref_id in self.token_index[t]:
-                            matched_scores[ref_id] += 3.0
+                            matched_scores[ref_id] += 6.0
 
-                # Channel B: Stripped 4-prefix
+                # Channel C: Stripped 4-prefix
                 if cand_prefix in self.prefix_index:
                     for ref_id in self.prefix_index[cand_prefix]:
                         matched_scores[ref_id] += 2.0
 
-                # Channel C: Phonetic similarity
+                # Channel D: Phonetic similarity
                 for pk in cand_pks:
                     if pk in self.phonetic_index:
                         for ref_id in self.phonetic_index[pk]:
                             matched_scores[ref_id] += 1.5
 
-                # Channel D: Numeric address matching
-                for nt in cand_num_set:
-                    if nt in self.addr_num_index:
-                        for ref_id in self.addr_num_index[nt]:
-                            if self.entity_meta[ref_id]["addr_tokens"].intersection(cand_at_set):
-                                matched_scores[ref_id] += 4.0
+                # Channel E: Compound Address Match: (street_number, addr_token)
+                cand_pc = {n for n in cand_num_set if len(n) in (5, 6)}
+                cand_st_nums = cand_num_set - cand_pc
+                if cand_st_nums:
+                    for sn_val in cand_st_nums:
+                        for at_val in addr_tokens[:4]:
+                            key = (sn_val, at_val)
+                            if key in self.st_num_addr_index:
+                                for ref_id in self.st_num_addr_index[key]:
+                                    matched_scores[ref_id] += 8.0
 
                 # Push to heaps
                 for ref_id, score in matched_scores.items():
@@ -143,6 +159,8 @@ class CandidateGenerator:
                         heap = candidates_heap[ref_id]
                         if len(heap) < self.top_k:
                             heapq.heappush(heap, (score, cand_id))
+                        elif score > heap[0][0]:
+                            heapq.heapreplace(heap, (score, cand_id))
                         elif score > heap[0][0]:
                             heapq.heapreplace(heap, (score, cand_id))
 

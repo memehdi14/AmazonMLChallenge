@@ -194,8 +194,9 @@ def run_validation_pipeline(data_dir: str, top_k: int = 50, num_s1: int = 2000):
     train_dir = os.path.join(data_dir, "train")
     print(f"\n--- 1. Loading {num_s1} Validation S1 Entities & Ground Truth ---", flush=True)
 
-    # Load Ground Truth
+    # 1. Load Ground Truth for num_s1 entities
     gt_map = {}
+    s1_needed = set()
     with open(os.path.join(train_dir, "train_ground_truth.tsv"), "r", encoding="utf-8") as f:
         next(f)
         for line in f:
@@ -203,14 +204,41 @@ def run_validation_pipeline(data_dir: str, top_k: int = 50, num_s1: int = 2000):
             s1_id = p[0]
             matches = set(p[1].split(",")) if len(p) > 1 and p[1] else set()
             gt_map[s1_id] = matches
+            s1_needed.add(s1_id)
             if len(gt_map) >= num_s1:
                 break
 
-    # Load S1 records
-    all_s1_ids, s1_records = load_and_preprocess_s1(
-        os.path.join(train_dir, "train_source1.tsv"),
-        max_records=num_s1
-    )
+    # 2. Load S1 records for EXACTLY the same s1_needed entities
+    all_s1_ids = []
+    s1_records = {}
+    with open(os.path.join(train_dir, "train_source1.tsv"), "r", encoding="utf-8") as f:
+        next(f)
+        for line in f:
+            parts = line.strip().split("\t")
+            eid = parts[0]
+            if eid in s1_needed:
+                name = parts[1] if len(parts) > 1 else ""
+                addr = parts[2] if len(parts) > 2 else ""
+                country = parts[3] if len(parts) > 3 else ""
+
+                clean_name, stripped_name, name_tokens = normalize_business_name(name)
+                clean_addr, landmark, addr_tokens, num_tokens = normalize_address(addr, country)
+
+                all_s1_ids.append(eid)
+                s1_records[eid] = {
+                    "name": name,
+                    "clean_name": clean_name,
+                    "stripped_name": stripped_name,
+                    "name_tokens": name_tokens,
+                    "clean_addr": clean_addr,
+                    "landmark": landmark,
+                    "has_landmark": 1 if landmark else 0,
+                    "addr_tokens": addr_tokens,
+                    "num_tokens": num_tokens,
+                    "country": country
+                }
+                if len(s1_records) >= len(s1_needed):
+                    break
 
     # Phase 1: Candidate Generation
     print("\n--- 2. Phase 1: Candidate Generation (Blocking) ---", flush=True)
