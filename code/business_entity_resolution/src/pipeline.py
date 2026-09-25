@@ -187,16 +187,116 @@ def build_pairwise_features(
     return df_features
 
 
+def run_validation_pipeline(data_dir: str, top_k: int = 50, num_s1: int = 2000):
+    """
+    Executes Phase 1, Phase 2, and Phase 3 on a held-out validation slice.
+    """
+    train_dir = os.path.join(data_dir, "train")
+    print(f"\n--- 1. Loading {num_s1} Validation S1 Entities & Ground Truth ---", flush=True)
+
+    # Load Ground Truth
+    gt_map = {}
+    with open(os.path.join(train_dir, "train_ground_truth.tsv"), "r", encoding="utf-8") as f:
+        next(f)
+        for line in f:
+            p = line.strip().split("\t")
+            s1_id = p[0]
+            matches = set(p[1].split(",")) if len(p) > 1 and p[1] else set()
+            gt_map[s1_id] = matches
+            if len(gt_map) >= num_s1:
+                break
+
+    # Load S1 records
+    all_s1_ids, s1_records = load_and_preprocess_s1(
+        os.path.join(train_dir, "train_source1.tsv"),
+        max_records=num_s1
+    )
+
+    # Phase 1: Candidate Generation
+    print("\n--- 2. Phase 1: Candidate Generation (Blocking) ---", flush=True)
+    candidates = generate_candidates(
+        s1_records=s1_records,
+        s2_path=os.path.join(train_dir, "train_source2.tsv"),
+        s3_path=os.path.join(train_dir, "train_source3.tsv"),
+        top_k=top_k,
+        min_score=3.0
+    )
+
+    # Evaluate Blocking Recall
+    blocking_eval = evaluate_blocking_recall(gt_map, candidates)
+    print("\n=== BLOCKING RECALL CEILING ===")
+    for k, v in blocking_eval.items():
+        if isinstance(v, float):
+            print(f"  {k}: {v:.4f}")
+        else:
+            print(f"  {k}: {v:,}")
+
+    # Phase 2: Feature Engineering
+    print("\n--- 3. Phase 2: Pairwise Feature Construction ---", flush=True)
+    df_features = build_pairwise_features(
+        s1_records=s1_records,
+        candidates=candidates,
+        s2_path=os.path.join(train_dir, "train_source2.tsv"),
+        s3_path=os.path.join(train_dir, "train_source3.tsv"),
+        ground_truth=gt_map
+    )
+
+    # Phase 3: LightGBM Training & Threshold Sweeping
+    print("\n--- 4. Phase 3: LightGBM Training & Threshold Optimization ---", flush=True)
+    from train_val_eval import evaluate_and_train_gbm
+    
+    needed_cand_ids = set()
+    for cands in candidates.values():
+        needed_cand_ids.update(cands)
+        
+    cand_records = {}
+    for src in [os.path.join(train_dir, "train_source2.tsv"), os.path.join(train_dir, "train_source3.tsv")]:
+        with open(src, "r", encoding="utf-8") as f:
+            next(f)
+            for line in f:
+                p = line.strip().split("\t")
+                if p[0] in needed_cand_ids:
+                    cn, sn, nt = normalize_business_name(p[1] if len(p) > 1 else "")
+                    ca, lm, at, nums = normalize_address(p[2] if len(p) > 2 else "", p[3] if len(p) > 3 else "")
+                    cand_records[p[0]] = {
+                        "clean_name": cn, "stripped_name": sn, "name_tokens": nt,
+                        "clean_addr": ca, "landmark": lm, "has_landmark": 1 if lm else 0,
+                        "addr_tokens": at, "num_tokens": nums, "country": p[3] if len(p) > 3 else ""
+                    }
+                    if len(cand_records) >= len(needed_cand_ids):
+                        break
+
+    model, best_thresh, best_f05, feature_cols = evaluate_and_train_gbm(
+        val_candidates=candidates,
+        s1_records=s1_records,
+        target_records=cand_records,
+        ground_truth=gt_map
+    )
+
+    # Save artifacts
+    artifacts_dir = os.path.join(os.path.dirname(__file__), "..", "artifacts")
+    os.makedirs(artifacts_dir, exist_ok=True)
+    import joblib, json
+    joblib.dump(model, os.path.join(artifacts_dir, "lgbm_model.pkl"))
+    with open(os.path.join(artifacts_dir, "config.json"), "w") as f:
+        json.dump({"threshold": best_thresh, "feature_cols": feature_cols, "val_f05": best_f05}, f, indent=2)
+    print(f"\nSaved trained model and config to {artifacts_dir}")
+
+
 def main():
     parser = argparse.ArgumentParser(description="Business Entity Resolution End-to-End Pipeline")
     parser.add_argument("--mode", choices=["validate", "test"], default="validate", help="Pipeline execution mode")
     parser.add_argument("--data-dir", default=r"c:\MMDPublic\Hackathons\Amazon ML challenge\Dataset\student_resource\dataset")
     parser.add_argument("--output-dir", default=r"c:\MMDPublic\Hackathons\Amazon ML challenge\output")
     parser.add_argument("--top-k", type=int, default=50, help="Candidate pool size per entity")
+    parser.add_argument("--num-val-s1", type=int, default=2000, help="Number of S1 validation entities")
     args = parser.parse_args()
 
-    print(f"Running pipeline in {args.mode.upper()} mode...")
-    # Pipeline execution logic will be invoked based on args.mode
+    print(f"=== Starting Pipeline in {args.mode.upper()} Mode ===", flush=True)
+    if args.mode == "validate":
+        run_validation_pipeline(data_dir=args.data_dir, top_k=args.top_k, num_s1=args.num_val_s1)
+    else:
+        print("Test mode selected.")
 
 
 if __name__ == "__main__":
