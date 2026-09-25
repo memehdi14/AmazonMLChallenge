@@ -115,14 +115,18 @@ def clean_base_text(text: str) -> str:
     """
     if not text or not isinstance(text, str):
         return ""
-    # Transliterate any non-Latin scripts to ASCII
+    # Transliterate and strip accents only for non-ASCII strings
     if not text.isascii():
-        text = anyascii.anyascii(text)
-    # Strip accents
-    text = strip_accents(text.lower())
-    # Handle web domains: "maurewilliamscolombier.com" -> "maurewilliamscolombier"
-    text = WEB_SUFFIX_REGEX.sub(r"\2", text)
-    text = text.replace("&", " and ")
+        text = strip_accents(anyascii.anyascii(text).lower())
+    else:
+        text = text.lower()
+
+    # Handle web domains only if dot present
+    if "." in text:
+        text = WEB_SUFFIX_REGEX.sub(r"\2", text)
+    if "&" in text:
+        text = text.replace("&", " and ")
+
     # Replace non-alphanumeric with space
     text = re.sub(r"[^a-z0-9\s]", " ", text)
     # Collapse multiple whitespaces
