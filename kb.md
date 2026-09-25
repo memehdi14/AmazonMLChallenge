@@ -29,6 +29,7 @@ Every run — successful or failed — gets one entry in the table below AND, if
 |---|---|---|---|---|---|---|---|---|---|---|---|---|
 | EXP-001 | 2026-09-25 | Phase 1-3 Baseline | Token + 4-prefix + Soundex + StNum-Addr[:4] | 80.72% | FS-v4 (31 feats) | LightGBM (400 trees, d=6) | 0.83 | 0.8333 | 0.8072 | 0.8314 | — | Baseline on 1,000 S1 val entities before Part A blocking fixes. |
 | EXP-002 | 2026-09-25 | Phase 1 Blocking Fixes (A1-A4) + LightGBM | Token + 4-prefix + Soundex + StNum-Addr(full) + Postal Exact Match (weight 10.0) | 86.21% | FS-v4 (31 feats) | LightGBM (400 trees, d=6) | 0.93 | 1.0000 | 0.8621 | 0.8722 | — | Recall ceiling jumped +5.49% (80.72%->86.21%), Macro F_0.5 rose +0.0408 (0.8314->0.8722). Singleton accuracy reached 100%. |
+| EXP-003 | 2026-09-25 | Phase 1 Blocking Scaling (Step 4 Bounded Top-N) | Bounded Per-Channel Top-15 + top_k=20 + min_score=8.0 + Common Stopwords Reconciled | — | FS-v4 (31 feats) | LightGBM (400 trees, d=6) | 0.93 | — | — | — | — | Scan throughput surged to 6,641 rows/s/worker (~92k rows/s aggregate). Heappush calls reduced 5.44x. Candidate pairs file size estimated at ~37-180 MB (safely below 512 MB limit). |
 
 **Column definitions:**
 - **Phase**: which phase of the build guide this corresponds to (Blocking / Feature Eng / GBM / Fine-tune / Threshold sweep)
@@ -64,6 +65,23 @@ Every run — successful or failed — gets one entry in the table below AND, if
 - **A3 (Pruning Thresholds):** Raised to 300/300/200 in generator without recall loss.
 - **A4 (min_score Sweep):** 3.0, 2.5, and 2.0 all yielded identical 86.21% recall with 50 candidates/entity; min_score=3.0 is optimal and avoids candidate bloat.
 **Next step suggested by this result:** Blocking recall ceiling at 86.21% is below the 95% gate. 475 matches were missed due to generic names without distinctive tokens (e.g. 'Ss Food', 'Hotel Enterprises') or numeric word mismatches ('fourth' vs '4th'). Move to Phase 4 (RTX A5000 dense multilingual embeddings via multilingual-e5-small) to bridge the remaining ~9-10% recall gap.
+
+## EXP-003 — Profiling-Driven Candidate Blocking Scaling & File Size Control
+**Date:** 2026-09-25
+**Hypothesis:** Single-worker cProfile revealed that 86.4% of scan time was spent accumulating candidate scores and pushing heaps (5,077,363 heappushes on 30k rows). Slicing channel postings to top-15/top-10 independently (Step 4) and setting top_k=20, min_score=8.0 will bound heap complexity and keep candidate_pairs.tsv safely under the 512 MB hard platform limit.
+**Change from previous best:**
+1. Reconciled `COMMON_STOPWORDS` across blocking.py, generate_submission.py, and profile_scan.py.
+2. Pinned `DEFAULT_MIN_SCORE = 8.0` with explicit scan logging.
+3. Implemented Step 4: Sliced posted lists per channel (`[:15]` for tokens/address, `[:10]` for prefix/phonetic/postal) to prevent combinatorial explosion.
+4. Capped `top_k = 20` to guarantee `candidate_pairs.tsv` file size remains safely under 512 MB.
+5. Added automated `candidate_pairs.tsv` size estimation and real file size validation before upload.
+**Result:**
+- Single-worker scan throughput surged from 1,549 rows/s to **6,641 rows/s** (4.52s on 30k rows, ~92k rows/s aggregate across 14 workers).
+- `heappush` count dropped from 5,077,363 to **933,993** (**5.44x reduction**).
+- `heappush` cumulative time dropped from 2.85s to **0.297s** (9.6x speedup).
+- Estimated `candidate_pairs.tsv` file size is ~37.1 MB on 30k sample and estimated full test size is ~150-250 MB (**safely below the 512 MB ceiling with >50% headroom**).
+**Next step suggested by this result:** Execute full test candidate generation and LightGBM inference, verify file sizes, and submit.
+
 
 ---
 
