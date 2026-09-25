@@ -164,7 +164,7 @@ Every leaderboard upload, regardless of whether it improved score — for tracki
 
 | Submission # | Date/time | Config used (Experiment ID) | Public LB score | Rank at time of submission | Notes |
 |---|---|---|---|---|---|
-| | | | | | |
+| SUB-001 | 2026-09-25 18:40 | EXP-003 (Step 4 Bounded Blocking + LightGBM d=6, thresh=0.93) | (Pending Upload) | — | 100% compliant baseline: candidate_pairs.tsv (378.7 MB), matching_results.tsv (80.1 MB). Validator PASS (Returncode: 0). |
 
 ---
 
