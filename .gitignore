@@ -7,26 +7,41 @@ dataset/
 *.csv
 *.zip
 *.tar.gz
+*.gz
 *.pdf
+*.parquet
+*.npy
+*.npz
 
-# Output directories
+# Model weights and checkpoints
+*.pt
+*.bin
+*.safetensors
+*.ckpt
+final_models/
+
+# Output and large artefacts
 output/
+artefacts/
 artifacts/
+handoff/
+logs/
 *.log
 *.pkl
 
-# Python cache
+# Python cache and environments
 __pycache__/
 *.py[cod]
-*$py.class
+*.class
 .pytest_cache/
+venv/
+env/
+.venv/
+.env
 
 # System and OS files
 .DS_Store
 __MACOSX/
 Thumbs.db
-
-# Virtual environments
-venv/
-env/
-.env
+.idea/
+.vscode/
