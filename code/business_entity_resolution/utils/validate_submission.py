@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-ML Challenge 2026 — Submission Validator
+ML Challenge 2026 - Submission Validator
 
 Run this BEFORE submitting. It checks your output files against every formatting
 rule the scorer enforces, so you can catch a rejection locally instead of burning
@@ -10,9 +10,9 @@ ground truth and never computes your score.
 
 It validates two files:
 
-* ``matching_results.tsv`` (required) — your final matches, the file scored on the
+* ``matching_results.tsv`` (required) - your final matches, the file scored on the
   leaderboard.
-* ``candidate_pairs.tsv`` (optional) — the candidate set from your blocking stage.
+* ``candidate_pairs.tsv`` (optional) - the candidate set from your blocking stage.
   When present, the validator also checks that your final matches are a subset of
   your candidates and *warns* (never fails) otherwise. When absent it is skipped
   with a warning; it is still expected in your final submission zip.
@@ -81,7 +81,7 @@ def load_match_targets(test_dir, warnings):
         path = os.path.join(test_dir, name)
         if not os.path.isfile(path):
             warnings.append(
-                f"{path} not found — skipping the (optional) check that matched "
+                f"{path} not found - skipping the (optional) check that matched "
                 f"IDs exist in the test set. Every other rule is still checked. "
                 f"This is the lighter-memory mode; provide test_source2/3.tsv to "
                 f"enable the ID-existence check."
@@ -115,7 +115,7 @@ def validate_id_list_file(path, expected_header, col_label, required, valid_ids,
             return None
         if DELIM not in header and "," in header:  # the #1 mistake: a CSV
             errors.append(
-                f"{name}: header has no TAB but contains commas — the file looks "
+                f"{name}: header has no TAB but contains commas - the file looks "
                 "COMMA-separated. Submissions must be TAB-separated (.tsv); "
                 "write it with df.to_csv(sep='\\t', index=False)."
             )
@@ -228,7 +228,7 @@ def validate(matching_path, candidate_path, test_dir, check_ids=False):
     else:
         valid_ids = None
         warnings.append(
-            "ID-existence check is OFF (the default) — not checking that matched/"
+            "ID-existence check is OFF (the default) - not checking that matched/"
             "candidate IDs exist in the test set. Every other rule is still checked. "
             "Re-run with --check-ids to enable it (needs test_source2/3.tsv; uses "
             "more memory). A nonexistent ID only lowers your score, never rejects "
@@ -250,7 +250,7 @@ def validate(matching_path, candidate_path, test_dir, check_ids=False):
         )
     elif candidate_path:
         warnings.append(
-            f"{candidate_path} not found — skipping candidate_pairs.tsv checks. "
+            f"{candidate_path} not found - skipping candidate_pairs.tsv checks. "
             "It is optional here, but your final submission zip must include "
             "output/candidate_pairs.tsv."
         )
@@ -266,7 +266,7 @@ def validate(matching_path, candidate_path, test_dir, check_ids=False):
             warnings.append(
                 f"{len(offenders)} S1 entity(ies) have matched IDs not present in "
                 f"candidate_pairs.tsv, e.g. {examples(offenders)}. Final matches "
-                "normally come from your blocking candidates — double-check these."
+                "normally come from your blocking candidates - double-check these."
             )
 
     return errors, warnings
@@ -300,7 +300,7 @@ def main():
         "--check-ids",
         action="store_true",
         help="Also check that every matched/candidate ID exists in the test "
-        "Source-2/3 files. Off by default (loads all S2/S3 IDs into memory — a few "
+        "Source-2/3 files. Off by default (loads all S2/S3 IDs into memory - a few "
         "GB on the full test set). A nonexistent ID only lowers your score, so this "
         "is a diagnostic, not a submission gate.",
     )
@@ -310,7 +310,7 @@ def main():
     # validate() skip (with a warning) if the file isn't there.
     candidate_path = args.candidate or "output/candidate_pairs.tsv"
 
-    print("ML Challenge 2026 — submission validator")
+    print("ML Challenge 2026 - submission validator")
     print(f"  test dir: {args.test_dir}")
     try:
         errors, warnings = validate(
@@ -318,10 +318,10 @@ def main():
         )
     except UnicodeDecodeError:
         print()
-        print("FAIL — 1 issue(s) to fix before submitting:")
+        print("FAIL - 1 issue(s) to fix before submitting:")
         print(
             f"  1. A file is not valid UTF-8 text (most likely {args.matching} or "
-            f"{candidate_path}). Re-save it as a plain UTF-8, tab-separated .tsv — "
+            f"{candidate_path}). Re-save it as a plain UTF-8, tab-separated .tsv - "
             "not cp1252/Latin-1, and not a compressed or binary file (.gz/.xlsx/"
             ".parquet) renamed to .tsv. In pandas: "
             "df.to_csv(path, sep='\\t', index=False, encoding='utf-8')."
@@ -329,7 +329,7 @@ def main():
         return 1
     except OSError as exc:
         print()
-        print("FAIL — 1 issue(s) to fix before submitting:")
+        print("FAIL - 1 issue(s) to fix before submitting:")
         print(f"  1. Could not read a file: {exc}.")
         return 1
 
@@ -337,11 +337,11 @@ def main():
     for warning in warnings:
         print(f"WARNING: {warning}")
     if errors:
-        print(f"FAIL — {len(errors)} issue(s) to fix before submitting:")
+        print(f"FAIL - {len(errors)} issue(s) to fix before submitting:")
         for i, error in enumerate(errors, 1):
             print(f"  {i}. {error}")
         return 1
-    print("PASS — no blocking issues found. Safe to submit.")
+    print("PASS - no blocking issues found. Safe to submit.")
     return 0
 
 

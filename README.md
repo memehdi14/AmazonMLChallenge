@@ -1,4 +1,4 @@
-# Business Entity Resolution — Amazon ML Challenge 2026
+# Business Entity Resolution - Amazon ML Challenge 2026
 
 For each Source 1 business, find all matching Source 2 / Source 3 records.
 Metric: macro F0.5 per S1 entity (singletons included).
@@ -8,7 +8,7 @@ Metric: macro F0.5 per S1 entity (singletons included).
 | | |
 |---|---|
 | S1 / S2 / S3 rows | 2.21M / 5.03M / 5.29M (test: 1.73M / 4.89M / 5.08M, incl. France) |
-| Singletons | 5.6% — most S1 have 2–6 matches (mean ≈ 3.5), so recall matters |
+| Singletons | 5.6% - most S1 have 2-6 matches (mean ≈ 3.5), so recall matters |
 | One-to-one | holds exactly: no S2/S3 id appears under two S1s |
 | Country | every true pair has the same country label → block within country |
 | Scripts | ~9% of S2 names are Devanagari/Bengali transliterations of English names |

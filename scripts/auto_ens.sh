@@ -1,5 +1,5 @@
 #!/bin/bash
-# usage: auto_ens.sh <tag> <new adapter dir> [more member dirs...]  — when <new dir> lands complete on ce-qwen:
+# usage: auto_ens.sh <tag> <new adapter dir> [more member dirs...]  - when <new dir> lands complete on ce-qwen:
 # average Qwen3 v11 adapter + members (src.ce_avg) -> held-out -> build output/v14_<tag> (v11 recipe) -> diff vs v11.
 set -f
 T=$1; shift; NEW=$1

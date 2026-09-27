@@ -39,7 +39,7 @@ for bd in full-results:full_out ce-large:ce_large_out ce-full:ce_full_out ce-fra
   git checkout origin/${bd%%:*} -- handoff/${bd##*:} && git reset -q handoff/${bd##*:}; done
 rm -f handoff/ce_qwen_out/*_rest*    # v11 coverage: Qwen3 fold-0 without the remainder file
 ```
-Held-out check (India/US fold-0, cross-fitted halves) — expect 0.9903:
+Held-out check (India/US fold-0, cross-fitted halves) - expect 0.9903:
 ```
 python -m src.stack_eval --pairs "handoff/full_out/oof_train_full_part*.parquet" \
   --extra ce_large=handoff/ce_large_out --extra ce_full=handoff/ce_full_out --extra qwen=handoff/ce_qwen_out \
@@ -60,7 +60,7 @@ count / platform (~650 France pairs between the laptop and HPC builds of v11); I
 ## Leaderboard log (27 Sep)
 | File | Change vs v11 | LB |
 |---|---|---|
-| v11 (26 Sep) | — | 0.986201 |
+| v11 (26 Sep) | - | 0.986201 |
 | v13_q35_s-0.25 | Qwen3.5-4B replaces Qwen3-4B | 0.985613 |
 | v14_ens2_s-0.5 | Qwen3 v11 + adapter #2 logit-averaged | 0.985777 |
 | **v16_v11_s-1.25** (HPC build, md5 e8ba1a0f…) | France shift −1 → −1.25 | **0.986232** |

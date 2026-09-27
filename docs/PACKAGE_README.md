@@ -1,4 +1,4 @@
-# Business Entity Resolution — reproduction guide
+# Business Entity Resolution - reproduction guide
 
 Regenerates `output/matching_results.tsv` and `output/candidate_pairs.tsv` from the raw challenge
 data using only this folder. No external data, APIs or lookups are used; the only downloaded
